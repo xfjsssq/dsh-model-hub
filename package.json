@@ -1,0 +1,47 @@
+{
+  "name": "dsh-model-hub",
+  "version": "0.1.0",
+  "description": "DSH 模型中心：双栏模型选择器（左提供商 / 右模型）+ 悬浮能力面板（上下文 / 输出 / 视觉 / 思考档位），改动真实生效。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "docs",
+    "cordis.patch.yml",
+    "README.md",
+    "test",
+    "tools",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "model-picker",
+    "model-selection"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-model-selection"
+      ],
+      "platform": "web"
+    }
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  }
+}

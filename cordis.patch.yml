@@ -1,0 +1,7 @@
+# dsh-model-hub — 宿主侧插件声明。
+# 关闭方式：把 enabled 改成 false（内置模型选择器随即完全恢复），或从 profile 的 bundles 里移除本包。
+- insert:
+    - id: dsh-model-hub
+      name: dsh-model-hub
+      config:
+        enabled: true
