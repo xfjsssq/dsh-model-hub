@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-hub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH 模型中心：双栏模型选择器（左提供商 / 右模型）+ 悬浮能力面板（上下文 / 输出 / 视觉 / 思考档位），改动真实生效。",
   "type": "module",
   "main": "./index.js",

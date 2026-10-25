@@ -520,7 +520,7 @@ test('revision 冲突会被重试并最终成功', async () => {
 
 // ---------------------------------------------------------------- routes
 
-test('routes：注册 10 条（v1.4 又加了 1 条），dispose 后清空', async () => {
+test('routes：注册 11 条（v1.5 又加了 client-state），dispose 后清空', async () => {
   freshPrefsHome();
   const host = makeHost();
   const m = mount(host.ctx);
@@ -528,6 +528,7 @@ test('routes：注册 10 条（v1.4 又加了 1 条），dispose 后清空', asy
     m.table.map((e) => e.path).sort(),
     [
       '/model-hub/api/catalog',
+      '/model-hub/api/client-state',
       '/model-hub/api/health',
       '/model-hub/api/model',
       '/model-hub/api/prefs',
@@ -1342,6 +1343,157 @@ test('model-remove 的 declaredAfter 反映写后声明层', async () => {
   m.dispose();
 });
 
+
+// ---------------------------------------------------------------- issue #1 诊断口
+
+test('health 初始：clientState 为 null，pluginVersion 读得到', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const body = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(body.clientState, null, '还没有任何上报');
+  assert.equal(body.clientStateAgeMs, null);
+  assert.equal(body.clientVersion, null);
+  assert.equal(typeof body.pluginVersion, 'string');
+  assert.equal(body.pluginVersion.length > 0, true, '宿主版本必须读得到（package.json）');
+  // 既有字段一个都不能少（纯新增）
+  for (const field of ['ok', 'name', 'prefix', 'enabled', 'prefsPath', 'hasLlm', 'hasSettings', 'webServerPort']) {
+    assert.equal(Object.hasOwn(body, field), true, field);
+  }
+  m.dispose();
+});
+
+test('★ 上报 → health 能读到阶段、版本与距今年龄', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const posted = (await m.send('POST', '/model-hub/api/client-state', {
+    stage: 'bundle-loaded',
+    clientVersion: '0.1.0+abc1234',
+    userAgent: 'Mozilla/5.0 (probe)',
+    at: '2026-10-24T13:21:00.000Z',
+  })).json();
+  assert.deepEqual(posted, { ok: true, stored: true });
+
+  const body = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(body.clientState.stage, 'bundle-loaded');
+  assert.equal(body.clientState.unknown, undefined, '白名单内的阶段不该被标 unknown');
+  assert.equal(body.clientState.userAgent, 'Mozilla/5.0 (probe)');
+  assert.equal(body.clientState.at, '2026-10-24T13:21:00.000Z', '客户端自报时间原样保留');
+  assert.equal(body.clientVersion, '0.1.0+abc1234', '★ 浏览器里跑的是哪一版');
+  assert.equal(typeof body.clientStateAgeMs, 'number');
+  assert.equal(body.clientStateAgeMs >= 0 && body.clientStateAgeMs < 10000, true, '年龄按宿主接收时间算');
+  m.dispose();
+});
+
+test('★ 三种失败状态可区分：bundle-loaded / apply-start(卡住) / slot-register-failed', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  // 场景一：bundle 加载了但 apply 没跑
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'bundle-loaded', clientVersion: '0.1.0+deadbee' });
+  let health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'bundle-loaded', '⇒ 能看出 apply 从未开始');
+  // 场景二：apply 开始但等服务卡住
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'waiting-services', missing: ['slots', 'modelDirectories', 'slots'] });
+  health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'waiting-services');
+  assert.deepEqual(health.clientState.missing, ['slots', 'modelDirectories'], '缺失服务去重后列出');
+  assert.equal(health.clientVersion, '0.1.0+deadbee', '版本粘性：无版本的上报不抹掉它');
+  // 场景三：槽位注册失败
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'slot-register-failed', error: 'duplicate slot conversation.input.model' });
+  health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'slot-register-failed');
+  assert.equal(health.clientState.error.includes('duplicate slot'), true, '错误原文可读');
+  assert.equal(health.clientVersion, '0.1.0+deadbee');
+  m.dispose();
+});
+
+test('★ 容错：空体 / 坏 JSON / 非 JSON content-type / 未知 stage 一律 200', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+
+  // 空体（无 body、无 content-type）
+  const empty = await m.send('POST', '/model-hub/api/client-state');
+  assert.equal(empty.state.status, 200);
+  assert.deepEqual(empty.json(), { ok: true, stored: true });
+  let health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'unknown');
+  assert.equal(health.clientState.unknown, true);
+
+  // 非 JSON content-type（用户手敲 curl 的常见情况）
+  const plain = await m.send('POST', '/model-hub/api/client-state', { stage: 'apply-ok' }, { 'content-type': 'text/plain' });
+  assert.equal(plain.state.status, 200);
+  assert.equal((await m.send('GET', '/model-hub/api/health')).json().clientState.stage, 'apply-ok');
+
+  // 坏 JSON：直接打 handler，绕过 send 的 JSON.stringify
+  const entry = m.table.find((row) => row.path === '/model-hub/api/client-state');
+  const res = fakeRes();
+  await entry.handler({
+    method: 'POST',
+    headers: {},
+    async *[Symbol.asyncIterator]() { yield Buffer.from('{ this is not json'); },
+  }, res);
+  assert.equal(res.state.status, 200);
+  assert.deepEqual(res.json(), { ok: true, stored: true });
+  assert.equal((await m.send('GET', '/model-hub/api/health')).json().clientState.stage, 'unknown', '坏 JSON 退化成 unknown');
+
+  // 未知 stage：原样保留 + unknown 标记（客户端可先上线）
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'brand-new-stage' });
+  health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'brand-new-stage', '原样保留');
+  assert.equal(health.clientState.unknown, true, '但标记 unknown');
+
+  // stage 不是字符串
+  await m.send('POST', '/model-hub/api/client-state', { stage: 42 });
+  health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'unknown');
+  assert.equal(health.clientState.unknown, true);
+
+  // body 是数组
+  await m.send('POST', '/model-hub/api/client-state', [1, 2, 3]);
+  assert.equal((await m.send('GET', '/model-hub/api/health')).json().clientState.stage, 'unknown');
+  m.dispose();
+});
+
+test('★ 多次上报取最新；error 超长被截断；诊断口不污染 prefs', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'bundle-loaded' });
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'apply-start' });
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'apply-ok' });
+  let health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'apply-ok', '★ 取最新一次');
+
+  const long = 'x'.repeat(5000);
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'apply-failed', error: long });
+  health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.error.length <= 4010, true, '超长 error 必须截断，避免撑爆内存/响应');
+  assert.equal(health.clientState.error.endsWith('（已截断）'), true);
+
+  // 只存内存：prefs 完全不受影响
+  const prefs = (await m.send('GET', '/model-hub/api/prefs')).json().prefs;
+  assert.deepEqual(prefs, { order: [], pinned: [], overrides: {}, pendingProviders: {} }, '★ 诊断信息不写 prefs');
+  m.dispose();
+});
+
+test('client-state 只收 POST；每个实例的状态互相隔离', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const wrong = await m.send('GET', '/model-hub/api/client-state');
+  assert.equal(wrong.state.status, 405);
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'apply-ok' });
+  assert.equal((await m.send('GET', '/model-hub/api/health')).json().clientState.stage, 'apply-ok');
+  // 另一个实例（模拟插件重载）不该看到上一个实例的状态
+  const m2 = mount(makeHost().ctx);
+  const fresh = (await m2.send('GET', '/model-hub/api/health')).json();
+  assert.equal(fresh.clientState, null, '状态按实例隔离，重载即复位');
+  m.dispose();
+  m2.dispose();
+});
 test('changed 只看值也成立；configuredDiff 在无声明层变化时为空', async () => {
   freshPrefsHome();
   const host = makeHost();

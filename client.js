@@ -61,6 +61,140 @@
  *   本文件不引入任何第三方依赖（只有 react / react-dom）。
  */
 
+/* ═══════════ 诊断（issue #1：静默失败必须可见 + 可一键上报）═══════════
+ * 放在**模块作用域**：factory 与 build/apply 都在模块作用域，两边都要能用。
+ * 失败类（stage 含 failed）→ document.title + 可关闭红框 + console.warn；
+ * waiting-services → 可关闭淡提示（非错误）；其余进度类 → 只留 console.debug，不动 UI。
+ * 每 stage 去重一次；全程 try/catch（诊断自身绝不能再抛）；上报 fire-and-forget。
+ */
+// 构建标签：随发布更新，经 /health 的 clientVersion 回显（用于对比“浏览器跑的是哪一版 vs 磁盘上是哪一版”）。
+var MH_BUILD = '0.2.0+2026-10-24'   // 构建标签（随发布更新；用于 /health 里对比“浏览器跑的是哪一版 vs 磁盘上是哪一版”）
+var MH_DIAG_SEEN = {}
+var MH_DIAG_BOX = 'mh-diag'
+var MH_DIAG_NOTICE = 'mh-diag-notice'
+
+/** 上报宿主（fire-and-forget：任何失败都忽略，绝不影响主流程）。 */
+var mhDiagPost = function (stage, error, extra) {
+	try {
+		if (typeof window === 'undefined' || typeof window.fetch !== 'function') return
+		// clientVersion 是宿主规范字段名（build 为它接受的别名）；
+		// bundle-loaded 必带版本 —— 宿主对版本做粘性处理，后续上报不会覆盖。
+		var body = { stage: String(stage), clientVersion: MH_BUILD, build: MH_BUILD }
+		if (error) body.error = String(error && error.message ? error.message : error).slice(0, 4000)
+		if (extra && extra.missing) body.missing = extra.missing
+		window.fetch('/model-hub/api/client-state', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		}).catch(function () {})
+	} catch (ignored) {}
+}
+
+var mhDiagText = function (stage, error, extra) {
+	var lines = ['stage: ' + stage, 'build: ' + MH_BUILD]
+	if (extra && extra.missing) lines.push('missing: ' + [].concat(extra.missing).join(', '))
+	var message = error && error.message ? String(error.message) : error ? String(error) : ''
+	if (message !== '') lines.push('error: ' + message)
+	var stack = error && error.stack ? String(error.stack).split('\n').slice(0, 4) : []
+	for (var i = 0; i < stack.length; i++) lines.push(stack[i])
+	return lines.join('\n')
+}
+
+var mhDiagRemove = function (id) {
+	try {
+		var node = document.getElementById(id)
+		if (node && node.parentNode) node.parentNode.removeChild(node)
+	} catch (ignored) {}
+}
+
+var mhDiagBox = function (stage, error, extra) {
+	try {
+		if (typeof document === 'undefined' || !document.body) return
+		mhDiagRemove(MH_DIAG_BOX)
+		var box = document.createElement('div')
+		box.id = MH_DIAG_BOX
+		box.setAttribute('data-model-hub', 'diagnostics')
+		box.style.cssText = [
+			'position:fixed', 'left:12px', 'bottom:12px', 'z-index:2147483000',
+			'max-width:min(560px,62vw)', 'max-height:42vh', 'overflow:auto',
+			'box-sizing:border-box', 'padding:10px 12px', 'border-radius:10px',
+			'background:#3a1214', 'color:#ffdada', 'border:1px solid #a33b3b',
+			'box-shadow:0 8px 28px rgba(0,0,0,.4)',
+			'font:11px/16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+			'white-space:pre-wrap', 'word-break:break-word', 'pointer-events:auto'
+		].join(';')
+		var head = document.createElement('div')
+		head.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px'
+		var title = document.createElement('span')
+		title.textContent = 'dsh-model-hub 诊断 · ' + stage
+		var close = document.createElement('span')
+		close.textContent = '\u00d7'
+		close.setAttribute('role', 'button')
+		close.setAttribute('aria-label', '关闭诊断')
+		close.setAttribute('data-model-hub', 'diagnostics-close')
+		close.style.cssText = 'margin-left:auto;cursor:pointer;padding:0 5px;border-radius:6px;background:rgba(255,255,255,.14)'
+		close.onclick = function () { mhDiagRemove(MH_DIAG_BOX) }
+		head.appendChild(title)
+		head.appendChild(close)
+		var body = document.createElement('div')
+		body.textContent = mhDiagText(stage, error, extra)
+		box.appendChild(head)
+		box.appendChild(body)
+		document.body.appendChild(box)
+	} catch (ignored) {}
+}
+
+/** 可关闭的淡提示（非错误态，例如等待内置模型选择器提供的服务）。 */
+var mhDiagNotice = function (text) {
+	try {
+		if (typeof document === 'undefined' || !document.body) return
+		if (document.getElementById(MH_DIAG_NOTICE)) return
+		var box = document.createElement('div')
+		box.id = MH_DIAG_NOTICE
+		box.setAttribute('data-model-hub', 'notice')
+		box.style.cssText = [
+			'position:fixed', 'left:12px', 'bottom:12px', 'z-index:2147483000',
+			'max-width:min(520px,60vw)', 'box-sizing:border-box',
+			'display:flex', 'align-items:center', 'gap:8px',
+			'padding:8px 10px', 'border-radius:10px',
+			'background:#3a2f14', 'color:#ffe9c2', 'border:1px solid #7a6220',
+			'box-shadow:0 6px 20px rgba(0,0,0,.3)', 'font:12px/18px inherit'
+		].join(';')
+		var label = document.createElement('span')
+		label.textContent = text
+		var close = document.createElement('span')
+		close.textContent = '\u00d7'
+		close.setAttribute('role', 'button')
+		close.setAttribute('aria-label', '关闭提示')
+		close.setAttribute('data-model-hub', 'notice-close')
+		close.style.cssText = 'margin-left:auto;cursor:pointer;padding:0 5px;border-radius:6px;background:rgba(255,255,255,.14)'
+		close.onclick = function () { mhDiagRemove(MH_DIAG_NOTICE) }
+		box.appendChild(label)
+		box.appendChild(close)
+		document.body.appendChild(box)
+	} catch (ignored) {}
+}
+
+/** 唯一诊断入口。 */
+var mhDiag = function (stage, error, extra) {
+	try {
+		var key = String(stage) + ':' + (extra && extra.missing ? [].concat(extra.missing).join(',') : '')
+		if (MH_DIAG_SEEN[key] === true) return
+		MH_DIAG_SEEN[key] = true
+		if (String(stage).indexOf('failed') >= 0) {
+			try { document.title = '[模型中心 ' + stage + '] ' + (error && error.message ? String(error.message).slice(0, 80) : '') } catch (ignored) {}
+			mhDiagBox(stage, error, extra)
+			console.warn('[dsh-model-hub] ' + stage, error || '', extra || '')
+		} else if (stage === 'waiting-services') {
+			mhDiagNotice('模型目录服务未就绪（内置模型选择器可能被禁用）')
+			console.warn('[dsh-model-hub] waiting-services', extra || '')
+		} else {
+			try { console.debug('[dsh-model-hub] ' + stage, extra || '') } catch (ignored) {}
+		}
+		mhDiagPost(stage, error, extra)
+	} catch (ignored) {}
+}
+
 window.__ModuleLoader__.load({
 	id: 'dsh-model-hub',
 	factory: (require) => {
@@ -72,10 +206,12 @@ window.__ModuleLoader__.load({
 			build(exports, require)
 		} catch (error) {
 			// 客户端 bundle 绝不把聊天界面拖下水：初始化失败 → 不注册，内置模型选择器照常工作。
-			console.error('[dsh-model-hub] 客户端 bundle 初始化失败，已放弃注册（内置模型选择器不受影响）：', error)
+			mhDiag('build-failed', error)
 			exports.inject = []
 			exports.apply = function () {}
 		}
+		mhDiag('bundle-loaded', null, { build: MH_BUILD })
+		exports.mhDiag = mhDiag
 
 		return module.exports
 	}
@@ -3014,74 +3150,111 @@ function useDirectorySnapshot(store) {
 	/* ══════════════════════════ 注册（遮蔽内置） ══════════════════════════ */
 
 	function apply(ctx) {
+		var WAIT_MS = 3000
+		var waitTimer = null
 		try {
+			mhDiag('apply-start')
 			ensureStyle()
-			var models = ctx.modelDirectories
-			var sessions = ctx.sessions
-			ctx.slots.inject('conversation.input.model', function () {
-				var dispose
-				try {
-					dispose = ctx.slots.register({
-						name: 'conversation.input.model',
-						// 负 priority：single 槽位里数值最小者渲染（内置未声明 priority ⇒ 0）。
-						priority: SHADOW_PRIORITY,
-						inject: function (sessionId) {
-							// 任何取目录的异常都不允许冒泡到 renderer（那会让整条 slot 条目被 abdicate，
-							// 插件看起来“完全没生效”）。降级为：触发器仍在，弹窗里给出明确错误。
-							var directory = null
-							var directoryError = null
-							try {
-								directory = models.directoryFor(sessionId)
-							} catch (error) {
-								directoryError = errorMessage(error)
-								console.warn('[dsh-model-hub] modelDirectories.directoryFor 失败，模型位降级显示（内置选择器不受影响）：', error)
-							}
-							var available = directoryError === null && sessions.subagentAddress(sessionId) === undefined
-							return {
-								available: available,
-								onFatal: function () { if (fatalDispose) fatalDispose() },
-								directoryError: directoryError,
-								directory: directory === null ? null : directory.store,
-								load: function () {
-									if (!available || directory === null) return
-									try { directory.load().catch(function () {}) } catch (ignored) {}
-								},
-								select: function (selection) {
-									if (!available || directory === null) {
-										return Promise.resolve({
-											ok: false,
-											error: { code: 'model-hub/unavailable', message: directoryError === null ? TEXT.unavailable : directoryError }
-										})
+
+			// 注册（拿到 modelDirectories / sessions 后调用；两条路径共用）
+			var register = function (models, sessions) {
+				ctx.slots.inject('conversation.input.model', function () {
+					var dispose
+					try {
+						dispose = ctx.slots.register({
+							name: 'conversation.input.model',
+							// 负 priority：single 槽位里数值最小者渲染（内置未声明 priority ⇒ 0）。
+							priority: SHADOW_PRIORITY,
+							inject: function (sessionId) {
+								// 任何取目录的异常都不允许冒泡到 renderer（那会让整条 slot 条目被 abdicate，
+								// 插件看起来“完全没生效”）。降级为：触发器仍在，弹窗里给出明确错误。
+								var directory = null
+								var directoryError = null
+								try {
+									directory = models.directoryFor(sessionId)
+								} catch (error) {
+									directoryError = errorMessage(error)
+									console.warn('[dsh-model-hub] modelDirectories.directoryFor 失败，模型位降级显示（内置选择器不受影响）：', error)
+								}
+								var available = directoryError === null && sessions.subagentAddress(sessionId) === undefined
+								return {
+									available: available,
+									onFatal: function () { if (fatalDispose) fatalDispose() },
+									directoryError: directoryError,
+									directory: directory === null ? null : directory.store,
+									load: function () {
+										if (!available || directory === null) return
+										try { directory.load().catch(function () {}) } catch (ignored) {}
+									},
+									select: function (selection) {
+										if (!available || directory === null) {
+											return Promise.resolve({
+												ok: false,
+												error: { code: 'model-hub/unavailable', message: directoryError === null ? TEXT.unavailable : directoryError }
+											})
+										}
+										return directory.select(selection)
 									}
-									return directory.select(selection)
 								}
 							}
+						}, ModelHubSeat)
+						fatalDispose = function () {
+							var current = dispose
+							dispose = null
+							fatalDispose = null
+							if (current) { try { current() } catch (ignored) {} }
 						}
-					}, ModelHubSeat)
-					fatalDispose = function () {
-						var current = dispose
-						dispose = null
-						fatalDispose = null
-						if (current) { try { current() } catch (ignored) {} }
+						mhDiag('slot-registered')
+					} catch (error) {
+						mhDiag('slot-register-failed', error)
+						dispose = undefined
 					}
-				} catch (error) {
-					console.error('[dsh-model-hub] 注册 conversation.input.model 失败，内置模型选择器保持生效：', error)
-					dispose = undefined
-				}
-				return function () { if (dispose) dispose() }
-			})
-			if (typeof window !== 'undefined') {
-				window.__DSH_MODEL_HUB__ = { version: MH_VERSION, priority: SHADOW_PRIORITY }
+					return function () { if (dispose) dispose() }
+				})
 			}
+
+			// modelDirectories 由**内置 ui-model-selection** 提供：用户禁用它时，exports.inject 里挂着它
+			// 会导致 apply 永不执行、静默永不启动（issue #1 的怀疑方向）。
+			// 所以只在内核服务上声明依赖，把这一项放进 apply 内部等待。
+			if (typeof ctx.inject === 'function') {
+				waitTimer = window.setTimeout(function () {
+					waitTimer = null
+					mhDiag('waiting-services', null, { missing: ['modelDirectories'] })
+				}, WAIT_MS)
+				ctx.inject(['modelDirectories'], function (scoped) {
+					if (waitTimer !== null) { window.clearTimeout(waitTimer); waitTimer = null }
+					// 服务到位 ⇒ 收掉“未就绪”提示（如果之前已出现）
+					mhDiagRemove(MH_DIAG_NOTICE)
+					var models = scoped && scoped.modelDirectories ? scoped.modelDirectories : ctx.modelDirectories
+					var sessions = scoped && scoped.sessions ? scoped.sessions : ctx.sessions
+					register(models, sessions)
+					return function () { if (waitTimer !== null) { window.clearTimeout(waitTimer); waitTimer = null } }
+				})
+			} else {
+				// 老宿主 / 沙盘没有 ctx.inject：照旧直接取（取不到就在 register 里退化）
+				register(ctx.modelDirectories, ctx.sessions)
+			}
+
+			if (typeof window !== 'undefined') {
+				window.__DSH_MODEL_HUB__ = { version: MH_VERSION, priority: SHADOW_PRIORITY, build: MH_BUILD }
+			}
+			mhDiag('apply-ok')
 		} catch (error) {
-			console.error('[dsh-model-hub] apply 失败，未做任何改动：', error)
+			// apply 已经失败：别再让等待定时器在 3s 后再报一次“服务未就绪”（那会误导排查方向）
+			if (waitTimer !== null) { window.clearTimeout(waitTimer); waitTimer = null }
+			mhDiag('apply-failed', error)
 		}
 	}
 
+	// 只声明**内核级**服务；modelDirectories（内置 ui-model-selection 提供）在 apply 内等，
+	// 否则用户禁用内置模型选择器时我们会永远等不到、静默不启动。
 	// remote / remote.session 必须由**消费方自己**声明：
 	// 内置 dsh-client-ui-model-selection/lib/client.js:1843-1850 就是这 6 个；
 	// 少了这两个，modelDirectories.directoryFor() 内部取 ctx.remote.session 时会抛
 	// 'cannot get property "remote.session" without inject'（typed-remote 的惰性 getter 检查的是调用方 fiber）。
-	exports.inject = ['slots', 'sessions', 'remote', 'remote.session', 'modelDirectories']
+	// 注意：modelDirectories 也依赖 remote.session —— 它在 apply 内的 ctx.inject 里等，
+	// 而 inject 链是**调用方 fiber** 的，所以这两个仍在 exports.inject 里声明。
+	exports.inject = ['slots', 'sessions', 'remote', 'remote.session']
+
 	exports.apply = apply
 }
