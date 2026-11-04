@@ -69,6 +69,77 @@
  */
 // 构建标签：随发布更新，经 /health 的 clientVersion 回显（用于对比“浏览器跑的是哪一版 vs 磁盘上是哪一版”）。
 var MH_BUILD = '0.2.0+2026-10-24'   // 构建标签（随发布更新；用于 /health 里对比“浏览器跑的是哪一版 vs 磁盘上是哪一版”）
+/* ═══════════ 测试专用：崩溃注入缝隙（**仅供自动化验证使用，生产默认关闭**）═══════════
+ * 开关：window.__DSH_MODEL_HUB_TEST_CRASH__（显式设置为 truthy ⇒ 能力卡子树必定抛错）。
+ *
+ * 设计约束（verifier 的复验结论，硬要求）：
+ *  1) **默认完全关闭**：未显式设置开关时，那段崩溃代码**根本不会被读到** ——
+ *     崩溃代码体以**字符串**存放（MH_TEST_CRASH_SRC），只有开关打开时才用 new Function 现场编译；
+ *     未开启时它既没被编译也没被执行。
+ *  2) **正常渲染路径不读 window 上的开关**：渲染路径只看模块级的一个函数引用
+ *     （MH_TEST_CRASH_HOOK，默认 null）。开关的赋值用** setter **捕获，
+ *     全程**不调用任何用户 getter**（只用 Object.getOwnPropertyDescriptor 取快照）⇒
+ *     验证方在 window 上装读取探针时，读次数恒为 0。
+ *  3) 打开后**稳定**让能力卡子树抛错；能力卡外面那层本地错误边界在本模式下把错误**继续往上抛**
+ *     （见 HubBoundary 的 propagateError 分支，只在错误路径上生效），
+ *     于是直达顶层边界 ⇒ 完整走通「让出槽位 → 内置选择器接管 → 可见提示 → 不刷新也能继续用」。
+ */
+var MH_TEST_CRASH_KEY = '__DSH_MODEL_HUB_TEST_CRASH__'
+var MH_TEST_CRASH_VALUE = undefined
+var MH_TEST_CRASH_ON = false
+var MH_TEST_CRASH_HOOK = null
+var MH_TEST_CRASH_ERROR = null
+// 崩溃代码体：**字符串**存放；未开启时不会被编译/执行。
+var MH_TEST_CRASH_SRC = 'return function () { throw new Error("dsh-model-hub: test crash via window.__DSH_MODEL_HUB_TEST_CRASH__") }'
+
+function mhTestCrashEnable() {
+	if (MH_TEST_CRASH_ON === true) return
+	MH_TEST_CRASH_ON = true
+	try {
+		MH_TEST_CRASH_HOOK = new Function(MH_TEST_CRASH_SRC)()
+	} catch (ignored) {
+		MH_TEST_CRASH_HOOK = null
+	}
+	try {
+		MH_TEST_CRASH_ERROR = new Error('dsh-model-hub: test crash via window.' + MH_TEST_CRASH_KEY)
+	} catch (ignored) {
+		MH_TEST_CRASH_ERROR = null
+	}
+}
+
+/** 描述符快照：只看 data property 的 value，**绝不调用 getter**（探针友好）。 */
+function mhTestCrashSync() {
+	if (typeof window === 'undefined') return
+	try {
+		var descriptor = Object.getOwnPropertyDescriptor(window, MH_TEST_CRASH_KEY)
+		if (descriptor === undefined || descriptor === null) return
+		if (!('value' in descriptor)) return
+		if (descriptor.value) {
+			MH_TEST_CRASH_VALUE = descriptor.value
+			mhTestCrashEnable()
+		}
+	} catch (ignored) {}
+}
+
+/** 安装缝隙：捕获 window 上的赋值（setter）；赋值前就已是数据属性时取一次快照。 */
+function mhTestCrashInstall() {
+	if (typeof window === 'undefined') return
+	mhTestCrashSync()
+	try {
+		Object.defineProperty(window, MH_TEST_CRASH_KEY, {
+			configurable: true,
+			enumerable: true,
+			get: function () { return MH_TEST_CRASH_VALUE },
+			set: function (value) {
+				MH_TEST_CRASH_VALUE = value
+				if (value) mhTestCrashEnable()
+			}
+		})
+	} catch (ignored) {}
+}
+mhTestCrashInstall()
+
+
 var MH_DIAG_SEEN = {}
 var MH_DIAG_BOX = 'mh-diag'
 var MH_DIAG_NOTICE = 'mh-diag-notice'
@@ -222,12 +293,14 @@ function build(exports, require) {
 	var createPortal = require('react-dom').createPortal
 	var h = React.createElement
 
-	var MH_VERSION = '0.1.0'
+	var MH_VERSION = '0.2.0'
 	var API_CATALOG = '/model-hub/api/catalog'
 	var API_PREFS = '/model-hub/api/prefs'
 	var API_MODEL = '/model-hub/api/model'
 	// task-9 B（契约 v1.3）
 	var API_PROVIDER = '/model-hub/api/provider'
+	var API_PROVIDER_EDIT = '/model-hub/api/provider/edit'
+	var API_PROVIDER_RENAME = '/model-hub/api/provider/rename'
 	var API_DISCOVER = '/model-hub/api/provider/discover'
 	var API_PROVIDER_MODELS = '/model-hub/api/provider/models'
 	var API_PROVIDER_TEMPLATES = '/model-hub/api/provider-templates'
@@ -305,15 +378,25 @@ function build(exports, require) {
 		errProviderId: '提供商 id 不能为空',
 		errBaseURL: 'Base URL 不能为空且必须是 http(s) 地址',
 		discoverTitle: '获取模型',
-		discoverHint: '勾选要启用的模型（覆盖写入）',
+		discoverHint: '勾选要新增的模型；已在列表里的模型置灰且不会被移除（要移除请用模型行尾的叉号）',
 		discoverEmpty: '没有可用的候选模型',
 		discoverLoading: '正在获取模型…',
-		discoverNeedOne: '至少勾选一个模型',
+		discoverNeedOne: '至少勾选一个模型（否则该渠道会没有模型）',
 		formProtocolFetchFailed: '取协议列表失败，已用内置列表',
 		discoverSelected: '已选 ',
 		selectAll: '全选',
 		clearAll: '取消全选',
 		confirm: '确定',
+		discoverAlreadyListed: '已在列表',
+		discoverAdded: '新增 ',
+		discoverKept: '，保留 ',
+		discoverNoop: '没有新增模型，已保持原样',
+		discoverNoopKept: '（已在列表 ',
+		discoverNoopKeptTail: ' 个）',
+		discoverSaving: '写入中…',
+		discoverMeta: '新增已选 ',
+		discoverMetaKept: ' 个 · 已在列表 ',
+		discoverMetaTail: ' 个（已在列表的模型不会因这次获取被移除）',
 		refreshModels: '刷新模型列表（获取该提供商的可用模型）',
 		providerSaved: '已保存待选提供商：',
 		expandOthers: '展开其他渠道的相似模型',
@@ -340,6 +423,13 @@ function build(exports, require) {
 		sessionBusy: '当前会话被其他窗口占用（可能开着另一个 DSH 实例），请关闭其它 DSH 后重试。',
 		selectFailed: '模型切换失败：',
 		failedNotEffective: '未生效',
+		provPanelTitle: '编辑提供商',
+		provPanelFieldId: '显示 ID',
+		provPanelPending: '待选',
+		provPanelSaved: '已保存',
+		provPanelRenameNote: '默认模型仍引用旧 id，需要去设置里手动改。',
+		provPanelEmptyHint: '留空表示不修改该字段',
+		errProviderDisplayName: '显示名不能为空',
 		version: MH_VERSION
 	}
 
@@ -385,7 +475,8 @@ function build(exports, require) {
 		'.mh-mask[data-open="false"]{opacity:0;transition:opacity 120ms cubic-bezier(.22,.61,.36,1)}',
 		'@keyframes mh-fade-in{from{opacity:0}to{opacity:1}}',
 
-		'.mh-panel{position:relative;z-index:1201;border:1px solid var(--dsw-alias-border-l1);display:flex;flex-direction:column;width:min(920px,calc(100vw - 48px));height:min(640px,calc(100vh - 96px));box-sizing:border-box;border-radius:20px;background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-shadow-lv3);color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px;overflow:hidden}',
+		// 面板容器同样铺不透明底（渐变层叠 bg-base）⇒ 面板半透明不会把整页带得发虚。
+		'.mh-panel{position:relative;z-index:1201;border:1px solid var(--dsw-alias-border-l1);display:flex;flex-direction:column;width:min(920px,calc(100vw - 48px));height:min(640px,calc(100vh - 96px));box-sizing:border-box;border-radius:20px;background:linear-gradient(var(--dsw-alias-bg-layer-2),var(--dsw-alias-bg-layer-2)),var(--dsw-alias-bg-base);box-shadow:var(--dsw-shadow-lv3);color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px;overflow:hidden}',
 		'.mh-panel[data-open="false"]{opacity:0;transform:scale(.99) translateY(4px);transition:opacity 120ms cubic-bezier(.22,.61,.36,1),transform 120ms cubic-bezier(.22,.61,.36,1)}',
 		'@keyframes mh-panel-in{from{transform:scale(.985) translateY(6px)}to{transform:none}}',
 
@@ -408,17 +499,26 @@ function build(exports, require) {
 		'.mh-sideList::-webkit-scrollbar-track,.mh-list::-webkit-scrollbar-track,.mh-card::-webkit-scrollbar-track{background:transparent}',
 		'.mh-prov{position:relative;display:flex;align-items:center;gap:8px;width:100%;padding:10px 12px;border:none;border-radius:10px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:20px;text-align:left;cursor:pointer;user-select:none;transition:background-color 140ms cubic-bezier(.22,.61,.36,1),color 140ms cubic-bezier(.22,.61,.36,1),box-shadow 140ms cubic-bezier(.22,.61,.36,1)}',
 		'.mh-prov:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+		// 优先级 = 选中态 > 置顶态 > hover 态（靠规则顺序 + :active/:hover 覆盖规则保证）。
+		// 亮色主题下 = 略深一点的底、暗色主题下 = 略亮一点的底（layer-1/2/3 在 DSH 亮色下同值，不能靠 layer 表达层级）。
+		'.mh-prov[data-pinned="true"]{background:color-mix(in srgb,var(--dsw-alias-label-primary) 6%,var(--dsw-alias-bg-layer-2))}',
+		'.mh-prov[data-pinned="true"]:hover{background:color-mix(in srgb,var(--dsw-alias-label-primary) 11%,var(--dsw-alias-bg-layer-2))}',
 		'.mh-prov[data-active="true"]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);font-weight:500}',
+		'.mh-prov[data-active="true"]:hover{background:var(--dsw-alias-interactive-bg-hover)}',
 		'.mh-prov:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary))}',
 		'.mh-prov[data-empty="true"]{color:var(--dsw-alias-label-dimmed)}',
 		'.mh-prov[data-dragging="true"]{opacity:.55}',
 		'.mh-prov[data-drop="above"]{box-shadow:inset 0 2px 0 0 var(--dsw-alias-brand-primary)}',
 		'.mh-prov[data-drop="below"]{box-shadow:inset 0 -2px 0 0 var(--dsw-alias-brand-primary)}',
-		'.mh-provBar{position:absolute;left:2px;top:9px;bottom:9px;width:3px;border-radius:999px;background:var(--dsw-alias-brand-primary);opacity:0;transform:scaleY(.4);transition:opacity 140ms cubic-bezier(.22,.61,.36,1),transform 140ms cubic-bezier(.22,.61,.36,1)}',
-		'.mh-prov[data-active="true"] .mh-provBar{opacity:1;transform:none}',
+		'.mh-provBar{position:absolute;left:2px;top:9px;bottom:9px;width:3px;border-radius:999px;background:var(--dsw-alias-brand-primary);opacity:0;transform:scaleY(.4);transition:opacity 140ms cubic-bezier(.22,.61,.36,1),transform 140ms cubic-bezier(.22,.61,.36,1),width 140ms cubic-bezier(.22,.61,.36,1),left 140ms cubic-bezier(.22,.61,.36,1)}',
+		'.mh-prov[data-active="true"] .mh-provBar{opacity:1;transform:none;width:3px;left:2px}',
+		// 置顶行：竖条常驻 + 加粗到 4px（左移到 1px，保持视觉左边线位置不变）。
+		'.mh-prov[data-pinned="true"]:not([data-active="true"]) .mh-provBar{opacity:1;transform:none;width:4px;left:1px}',
+		// 选中态优先于置顶态：选中的行（含已置顶）竖条仍是 3px + 选中底色。
 		'.mh-provName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
 		'.mh-provCount{flex:none;font-size:12px;color:var(--dsw-alias-label-tertiary)}',
 		'.mh-provPin{flex:none;display:none;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;transition:background-color 140ms cubic-bezier(.22,.61,.36,1),color 140ms cubic-bezier(.22,.61,.36,1)}',
+		// 图钉：未置顶的行只在 hover 时露出来；**置顶的行常驻**（“有图钉”本身就是明确的置顶信号）。
 		'.mh-prov:hover .mh-provPin{display:inline-flex}',
 		'.mh-prov[data-pinned="true"] .mh-provPin{display:inline-flex;color:var(--dsw-alias-brand-primary)}',
 		'.mh-provPin:hover{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary)}',
@@ -515,7 +615,10 @@ function build(exports, require) {
 		'.mh-modalities{display:flex;align-items:center;gap:10px}',
 
 		// task-9 B：全屏页（添加提供商 / 获取模型）
-		'.mh-page{position:absolute;inset:0;z-index:3;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-2);animation:mh-panel-in 140ms cubic-bezier(.22,.61,.36,1) backwards}',
+		// 全屏页（添加提供商 / 获取模型）：底色必须**不透明** —— 面板直接浮在聊天区上（无遮罩），
+		// 而 DSH 主题的 bg-layer-2 可能带 alpha ⇒ 聊天内容会透上来、文字难读。
+		// 写法：渐变层（即使半透明）叠在 bg-base（不透明基色）之上 ⇒ 合成结果不透明。
+		'.mh-page{position:absolute;inset:0;z-index:3;display:flex;flex-direction:column;background:linear-gradient(var(--dsw-alias-bg-layer-2),var(--dsw-alias-bg-layer-2)),var(--dsw-alias-bg-base);animation:mh-panel-in 140ms cubic-bezier(.22,.61,.36,1) backwards}',
 		'.mh-pageHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l2)}',
 		'.mh-pageTitle{font-size:14px;font-weight:600;line-height:20px}',
 		'.mh-pageClose{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}',
@@ -539,10 +642,16 @@ function build(exports, require) {
 		'.mh-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
 		'.mh-toolbarCount{margin-left:auto;font-size:11px;color:var(--dsw-alias-label-tertiary)}',
 		'.mh-discoverList{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:1px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:4px}',
-		'.mh-discoverRow{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;font-size:12px;line-height:18px;cursor:pointer}',
+		// 候选行给**实底**（渐变层叠 bg-base）而不是透明 ⇒ 密集列表读得清。
+		'.mh-discoverRow{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;font-size:12px;line-height:18px;cursor:pointer;background:linear-gradient(var(--dsw-alias-bg-layer-2),var(--dsw-alias-bg-layer-2)),var(--dsw-alias-bg-base)}',
 		'.mh-discoverRow:hover{background:var(--dsw-alias-interactive-bg-hover)}',
 		'.mh-discoverId{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
 		'.mh-discoverName{flex:none;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11px}',
+		'.mh-discoverExisting{flex:none;height:16px;padding:0 6px;font-size:11px;font-weight:500;line-height:14px}',
+		'.mh-discoverRow[data-existing="true"]{cursor:default}',
+		'.mh-discoverRow[data-existing="true"] .mh-discoverId{color:var(--dsw-alias-label-tertiary)}',
+		'.mh-discoverRow[data-existing="true"]:hover{background:linear-gradient(var(--dsw-alias-bg-layer-2),var(--dsw-alias-bg-layer-2)),var(--dsw-alias-bg-base)}',
+		'.mh-mergeNote{margin:0 16px 10px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}',
 		// 刷新按钮（模型列表右下角）
 		'.mh-refresh{position:absolute;right:12px;bottom:12px;z-index:2;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-3,var(--dsw-alias-bg-layer-2));color:var(--dsw-alias-label-secondary);cursor:pointer;box-shadow:var(--dsw-shadow-lv2)}',
 		'.mh-refresh:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
@@ -554,6 +663,25 @@ function build(exports, require) {
 		'.mh-pageError{padding:6px 8px;border-radius:8px;background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px}',
 		'.mh-fallback{position:fixed;right:24px;bottom:120px;z-index:1203;max-width:280px;box-sizing:border-box;padding:10px 12px;border-radius:12px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);box-shadow:var(--dsw-shadow-lv3);color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}',
 		'.mh-visuallyHidden{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}',
+
+		// 提供商悬浮编辑面板：portal 到 body、position:fixed、z-index 1300（必须高于 .mh-mask/.mh-panel 的 1200 级）。
+		'.mh-provPanel{box-sizing:border-box;position:fixed;z-index:1300;width:240px;max-height:calc(100vh - 24px);overflow-y:auto;padding:10px 12px;border-radius:12px;background:var(--dsw-alias-bg-layer-3,var(--dsw-alias-bg-layer-2));border:1px solid var(--dsw-alias-border-l1);box-shadow:var(--dsw-shadow-lv2,var(--dsw-shadow-lv3));color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;animation:mh-provPanel-in 140ms cubic-bezier(.22,.61,.36,1) backwards}',
+		'@keyframes mh-provPanel-in{from{opacity:0;transform:translateX(-4px)}to{opacity:1;transform:none}}',
+		'.mh-provPanel[data-side="right"]{animation-name:mh-provPanel-in-right}',
+		'@keyframes mh-provPanel-in-right{from{opacity:0;transform:translateX(4px)}to{opacity:1;transform:none}}',
+		'.mh-provPanelHead{display:flex;align-items:center;gap:6px;margin-bottom:8px}',
+		'.mh-provPanelTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600;line-height:16px}',
+		'.mh-provPanelBadge{flex:none;padding:0 5px;border-radius:999px;font-size:10px;line-height:15px;color:var(--dsw-alias-state-warn-primary,var(--dsw-alias-label-secondary));background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,var(--dsw-alias-label-secondary)) 15%,transparent)}',
+		'.mh-provPanelField{margin-bottom:6px}',
+		'.mh-provPanelLabel{display:block;margin-bottom:2px;font-size:11px;line-height:14px;color:var(--dsw-alias-label-tertiary)}',
+		'.mh-provPanelInput{box-sizing:border-box;width:100%;height:26px;padding:0 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:16px}',
+		'.mh-provPanelInput:focus-visible{outline:none;border-color:var(--dsw-alias-brand-primary);box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary))}',
+		'.mh-provPanelInput:disabled{opacity:.6}',
+		'.mh-provPanelNote{margin-top:2px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-tertiary)}',
+		'.mh-provPanelWarn{margin-top:6px;font-size:11px;line-height:16px;color:var(--dsw-alias-state-warn-primary,var(--dsw-alias-label-secondary))}',
+		'.mh-provPanelError{display:flex;align-items:flex-start;gap:6px;margin-top:8px;font-size:11px;line-height:16px;color:var(--dsw-alias-state-error-primary)}',
+		'.mh-provPanelFoot{display:flex;align-items:center;justify-content:flex-end;gap:6px;margin-top:10px}',
+		'.mh-provPanelFoot .mh-btn{height:26px;padding:0 10px;font-size:12px}',
 		'@media (prefers-reduced-motion: reduce){.mh-trigger,.mh-mask,.mh-panel,.mh-card,.mh-prov,.mh-provBar,.mh-model,.mh-segBtn,.mh-triggerChevron,.mh-search,.mh-searchClear,.mh-provPin{transition-duration:1ms !important}.mh-spin,.mh-skelBar,.mh-mask,.mh-panel,.mh-card{animation-duration:1ms !important;animation-iteration-count:1 !important}}'
 	].join('\n')
 
@@ -687,13 +815,28 @@ function strArray(value) {
 		return { score: score, indexes: indexes }
 	}
 
+	/** 上下文/输出上限的短标签。
+	 *  值一律不动（131072 / 262144 / 1000000 都是厂商声明过的原值）；这里只管**显示口径**：
+	 *  - 131072 → 128K、262144 → 256K（二进制 K，行业惯例）；
+	 *  - 1000000 → 1M（它本身是十进制口径，写成「1000K」最别扭）；
+	 *  - ≥1M 用 1000 进制（10000000 → 10M，而不是 9766K）。
+	 */
 	function contextLabel(value) {
 		if (typeof value !== 'number' || !isFinite(value) || value <= 0) return null
 		if (value === 131072) return '128K'
 		if (value === 262144) return '256K'
-		if (value === 1000000) return '1000K'
-		// A3：≥1,000,000 用 1000 进制（10000000 → 10000K，而不是 9766K）。
-		return (value >= 1000000 ? Math.round(value / 1000) : Math.round(value / 1024)) + 'K'
+		if (value >= 1000000) {
+			var megabytes = Math.round((value / 1000000) * 10) / 10
+			return String(megabytes) + 'M'
+		}
+		return Math.round(value / 1024) + 'K'
+	}
+
+	/** 短标签 + 精确值（给 chip 的 title/aria 用）：「128K（131072）」。 */
+	function contextLabelTitle(value) {
+		var label = contextLabel(value)
+		if (label === null) return null
+		return label + '（' + String(value) + '）'
 	}
 
 	function modelKeyOf(providerId, modelId) {
@@ -1087,10 +1230,15 @@ function strArray(value) {
 		constructor(props) {
 			super(props)
 			this.state = { failed: false }
+			// 测试缝隙专用：props.propagateError === true 时，错误路径上把错误继续往上抛（正常渲染路径完全不受影响）。
 		}
 		static getDerivedStateFromError() { return { failed: true } }
 		componentDidCatch(error) {
 			console.warn('[dsh-model-hub] 子树渲染失败，已就地降级：', error)
+			if (this.props.propagateError === true) {
+				// 测试缝隙：让错误直达顶层边界（走完整的让位链）。
+				throw error
+			}
 			if (typeof this.props.onFatal !== 'function' || this.fatalReported === true) return
 			this.fatalReported = true
 			var onFatal = this.props.onFatal
@@ -1178,6 +1326,8 @@ function strArray(value) {
 	/* ══════════════════════════ 悬浮能力卡 ══════════════════════════ */
 
 	function HoverCard(props) {
+		// ── 测试专用崩溃缝隙（默认关闭；MH_TEST_CRASH_HOOK 为 null 时这段不会被执行）──
+		if (MH_TEST_CRASH_HOOK !== null) MH_TEST_CRASH_HOOK()
 		var model = props.model
 		var provider = props.provider
 		var meta = model.meta
@@ -1361,7 +1511,8 @@ function strArray(value) {
 	function buildStepOptions(steps, current, anomalyLimit) {
 		var anomalous = typeof current === 'number' && typeof anomalyLimit === 'number' && current > anomalyLimit && steps.indexOf(current) < 0
 		var options = steps.map(function (value) {
-			return { value: value, label: contextLabel(value), title: String(value) + ' tokens' }
+			var stepTitle = contextLabelTitle(value)
+		return { value: value, label: contextLabel(value), title: stepTitle === null ? String(value) + ' tokens' : stepTitle + ' · ' + String(value) + ' tokens' }
 		})
 		if (typeof current === 'number' && current > 0 && steps.indexOf(current) < 0) {
 			options.push({
@@ -1372,6 +1523,94 @@ function strArray(value) {
 			})
 		}
 		return options
+	}
+
+	/* ══════════════════════════ 提供商悬浮编辑面板 ══════════════════════════ */
+
+	/** 提供商行的悬浮编辑面板：portal 到 document.body、position:fixed、z-index 1300（高于遮罩）。
+	 *  字段语义与 DSH 设置页的提供商配置一致：名称 / 显示 ID / API 协议 / Base URL / Key 环境变量名。
+	 *  pending（待选）提供商走同一套 edit 接口，标题旁标「待选」。 */
+	function ProviderEditPanel(props) {
+		var provider = props.provider
+		var draft = props.draft
+		var busy = props.busy === true
+		var protocols = Array.isArray(props.protocols) ? props.protocols : PROVIDER_APIS
+		var currentApi = typeof provider.api === 'string' && provider.api !== '' ? provider.api : PROVIDER_APIS[0].id
+		var hasCurrent = false
+		for (var pi = 0; pi < protocols.length; pi++) if (protocols[pi].id === currentApi) hasCurrent = true
+		var options = hasCurrent ? protocols.slice() : protocols.concat([{ id: currentApi, label: currentApi }])
+		var value = function (field) {
+			var raw = draft ? draft[field] : ''
+			return typeof raw === 'string' ? raw : ''
+		}
+		var setField = function (field) {
+			return function (event) { props.onChange(field, event.target.value) }
+		}
+		var field = function (key, label, control) {
+			return h('div', { key: key, className: 'mh-provPanelField' }, [
+				h('span', { key: 'l', className: 'mh-provPanelLabel' }, label),
+				control
+			])
+		}
+		var input = function (key, placeholder) {
+			return h('input', {
+				key: 'i',
+				className: 'mh-provPanelInput',
+				type: 'text',
+				value: value(key),
+				disabled: busy,
+				placeholder: placeholder,
+				'data-model-hub': 'prov-panel-' + key,
+				onChange: setField(key)
+			})
+		}
+		return h('div', {
+			ref: props.panelRef,
+			className: 'mh-provPanel',
+			'data-side': props.side || 'left',
+			style: { left: props.left + 'px', top: props.top + 'px' },
+			role: 'dialog',
+			'aria-label': TEXT.provPanelTitle + ' · ' + provider.name,
+			'data-model-hub': 'prov-panel',
+			onMouseEnter: props.onMouseEnter,
+			onMouseLeave: props.onMouseLeave,
+			onKeyDown: function (event) {
+				if (event.key !== 'Escape') return
+				event.preventDefault()
+				event.stopPropagation()
+				if (!busy) props.onCancel()
+			}
+		}, [
+			h('div', { key: 'head', className: 'mh-provPanelHead' }, [
+				h('span', { key: 't', className: 'mh-provPanelTitle', title: provider.name }, provider.name),
+				provider.pending === true ? h('span', { key: 'b', className: 'mh-provPanelBadge', title: TEXT.pendingProvider }, TEXT.provPanelPending) : null
+			]),
+			field('displayName', TEXT.fieldDisplayName, input('displayName', provider.name)),
+			field('id', TEXT.provPanelFieldId, input('id', provider.id)),
+			field('api', TEXT.fieldApi, h('select', {
+				key: 's',
+				className: 'mh-provPanelInput',
+				value: value('api') === '' ? currentApi : value('api'),
+				disabled: busy,
+				'data-model-hub': 'prov-panel-api',
+				onChange: setField('api')
+			}, options.map(function (protocol) {
+				return h('option', { key: protocol.id, value: protocol.id }, protocol.label)
+			}))),
+			field('baseURL', TEXT.fieldBaseURL, input('baseURL', 'https://api.example.com/v1')),
+			field('apiKeyEnv', TEXT.fieldApiKeyEnv, input('apiKeyEnv', 'MY_PROVIDER_API_KEY')),
+			h('div', { key: 'eh', className: 'mh-provPanelNote', title: TEXT.provPanelEmptyHint }, TEXT.provPanelEmptyHint),
+			props.warn ? h('div', { key: 'w', className: 'mh-provPanelWarn', role: 'status' }, props.warn) : null,
+			props.error ? h('div', { key: 'e', className: 'mh-provPanelError', role: 'alert' }, [
+				h('span', { key: 'd', className: 'mh-dot' }),
+				h('span', { key: 'm' }, props.error)
+			]) : null,
+			h('div', { key: 'foot', className: 'mh-provPanelFoot' }, [
+				props.saved === true ? h('span', { key: 'sv', className: 'mh-provPanelNote', style: { marginRight: 'auto', marginTop: '0' } }, TEXT.provPanelSaved) : null,
+				h('button', { key: 'c', type: 'button', className: 'mh-btn', disabled: busy, onClick: props.onCancel }, TEXT.cancel),
+				h('button', { key: 's', type: 'button', className: 'mh-btn mh-btnPrimary', disabled: busy, onClick: props.onSave }, busy ? TEXT.saving : TEXT.save)
+			])
+		])
 	}
 
 	/* ══════════════════════════ 弹窗主体 ══════════════════════════ */
@@ -1495,6 +1734,44 @@ function strArray(value) {
 		var discoverState = React.useState(null)
 		var discover = discoverState[0]
 		var setDiscover = discoverState[1]
+		// 合并结果提示：「新增 N，保留 M」（确定成功后显示在列表页）
+		var mergeNoteState = React.useState(null)
+		var mergeNote = mergeNoteState[0]
+		var setMergeNote = mergeNoteState[1]
+
+		// ── 提供商行的悬浮编辑面板（悬停左栏提供商行 → 正左侧弹出）──
+		var provPanelState = React.useState(null)
+		var provPanel = provPanelState[0]
+		var setProvPanel = provPanelState[1]
+		var provPanelIdRef = React.useRef(null)
+		var provPanelOrigRef = React.useRef(null)
+		var provPanelPosState = React.useState(null)
+		var provPanelPos = provPanelPosState[0]
+		var setProvPanelPos = provPanelPosState[1]
+		var provPanelDraftState = React.useState(null)
+		var provPanelDraft = provPanelDraftState[0]
+		var setProvPanelDraft = provPanelDraftState[1]
+		var provPanelBusyState = React.useState(false)
+		var provPanelBusy = provPanelBusyState[0]
+		var setProvPanelBusy = provPanelBusyState[1]
+		var provPanelErrorState = React.useState(null)
+		var provPanelError = provPanelErrorState[0]
+		var setProvPanelError = provPanelErrorState[1]
+		var provPanelWarnState = React.useState(null)
+		var provPanelWarn = provPanelWarnState[0]
+		var setProvPanelWarn = provPanelWarnState[1]
+		var provPanelSavedState = React.useState(false)
+		var provPanelSaved = provPanelSavedState[0]
+		var setProvPanelSaved = provPanelSavedState[1]
+		var provOpenTimer = React.useRef(null)
+		var provCloseTimer = React.useRef(null)
+		var provPanelRef = React.useRef(null)
+		var provRowRefs = React.useRef({})
+		// 悬停那一刻的行矩形（渲染期算临时位置用；layout effect 再按实测面板尺寸纠正）
+		var provRowRectRef = React.useRef(null)
+		// 能力卡是否正开着（ref：定时器里要读到最新值，不能靠闭包里的旧 state）
+		var cardOpenRef = React.useRef(false)
+		var sideListRef = React.useRef(null)
 		// 协议下拉：默认用内置列表；打开表单时向宿主取 /provider-templates 覆盖（宿主说以它的顺序为准）
 		var protocolsState = React.useState(PROVIDER_APIS)
 		var providerProtocols = protocolsState[0]
@@ -1735,6 +2012,157 @@ function strArray(value) {
 			}, 140)
 		}
 
+
+		/* ---- 提供商悬浮编辑面板 ---- */
+
+		var PROV_PANEL_GAP = 10
+		var PROV_PANEL_MIN = 12
+
+		var clearProvTimers = function () {
+			if (provOpenTimer.current !== null) { window.clearTimeout(provOpenTimer.current); provOpenTimer.current = null }
+			if (provCloseTimer.current !== null) { window.clearTimeout(provCloseTimer.current); provCloseTimer.current = null }
+		}
+		var clearProvCloseTimer = function () {
+			if (provCloseTimer.current !== null) { window.clearTimeout(provCloseTimer.current); provCloseTimer.current = null }
+		}
+		var closeProvPanel = function () {
+			clearProvTimers()
+			provPanelIdRef.current = null
+			provPanelOrigRef.current = null
+			setProvPanel(null)
+			setProvPanelPos(null)
+			setProvPanelError(null)
+			setProvPanelWarn(null)
+			setProvPanelSaved(false)
+		}
+		// 鼠标离开提供商行后延迟关闭（让鼠标来得及移进面板）。
+		// relatedTarget 落在面板里 ⇒ 鼠标是「移进面板」而不是「离开」，此时绝不关。
+		/** relatedTarget 是否落在面板里（原生事件优先：React 合成事件的 relatedTarget 可能是 window）。 */
+		var relatedInsidePanel = function (event) {
+			if (!event) return false
+			var related = event.nativeEvent && event.nativeEvent.relatedTarget ? event.nativeEvent.relatedTarget : event.relatedTarget
+			if (!related || typeof related.nodeType !== 'number') return false
+			var node = provPanelRef.current
+			if (node === null) return false
+			try { return node.contains(related) } catch (ignored) { return false }
+		}
+
+		var scheduleCloseProvPanel = function (event) {
+			if (relatedInsidePanel(event)) {
+				clearProvCloseTimer()
+				return
+			}
+			clearProvTimers()
+			provCloseTimer.current = window.setTimeout(function () {
+				provCloseTimer.current = null
+				if (!mountedRef.current) return
+				closeProvPanel()
+			}, 260)
+		}
+		var provPanelDraftOf = function (provider) {
+			return {
+				displayName: typeof provider.name === 'string' && provider.name !== '' ? provider.name : provider.id,
+				id: provider.id,
+				api: typeof provider.api === 'string' && provider.api !== '' ? provider.api : PROVIDER_APIS[0].id,
+				baseURL: typeof provider.baseURL === 'string' ? provider.baseURL : '',
+				apiKeyEnv: typeof provider.apiKeyEnv === 'string' ? provider.apiKeyEnv : ''
+			}
+		}
+		// 悬停提供商行约 120ms 后弹出（固定对齐那一行，不跟随鼠标）
+		var scheduleOpenProvPanel = function (provider) {
+			clearProvCloseTimer()
+			if (provOpenTimer.current !== null) { window.clearTimeout(provOpenTimer.current); provOpenTimer.current = null }
+			provOpenTimer.current = window.setTimeout(function () {
+				provOpenTimer.current = null
+				if (!mountedRef.current) return
+				// 能力卡与提供商面板互斥：面板出现前先把能力卡关掉。
+				clearCardTimers()
+				if (cardOpenRef.current === true) setCard(null)
+				var rowNode = provRowRefs.current[provider.id]
+			provRowRectRef.current = rowNode ? rowNode.getBoundingClientRect() : null
+			if (provPanelIdRef.current !== provider.id) {
+					provPanelIdRef.current = provider.id
+					var draft = provPanelDraftOf(provider)
+					provPanelOrigRef.current = draft
+					setProvPanelDraft(draft)
+					setProvPanelError(null)
+					setProvPanelWarn(null)
+					setProvPanelSaved(false)
+				}
+				setProvPanel(provider)
+			}, 120)
+		}
+
+		// 面板几何：默认贴在该行的**正左侧**；左侧放不下就退到该行右侧；纵向夹在视口内。
+		var provPanelPosOf = function (rowRect, width, height) {
+			var vw = window.innerWidth
+			var vh = window.innerHeight
+			var side = 'left'
+			var left = rowRect.left - width - PROV_PANEL_GAP
+			if (left < PROV_PANEL_MIN) {
+				side = 'right'
+				left = rowRect.right + PROV_PANEL_GAP
+			}
+			if (left + width > vw - PROV_PANEL_MIN) left = Math.max(PROV_PANEL_MIN, vw - PROV_PANEL_MIN - width)
+			// 纵向：以行为基准**居中偏上** —— 让被悬停的行落在面板里「显示 ID ~ API 协议」那一段
+			// （height 的 36% 处 ≈ 显示 ID / API 协议所在位置），而不是贴着面板顶。
+			var top = rowRect.top + (rowRect.height / 2) - Math.round(height * 0.36)
+			if (top + height > vh - PROV_PANEL_MIN) top = vh - PROV_PANEL_MIN - height
+			if (top < PROV_PANEL_MIN) top = PROV_PANEL_MIN
+			return { left: Math.round(left), top: Math.round(top), side: side }
+		}
+		// 渲染期的临时位置：面板还没量到尺寸时，先按默认 240×280 摆在行的左侧；
+		// 纵向公式与 provPanelPosOf 一致（居中偏上 0.36），避免挂载前后跳位。
+		var provPanelTempPos = function () {
+			var rect = provRowRectRef.current
+			if (rect === null) return { left: 12, top: 12, side: 'left' }
+			return provPanelPosOf(rect, 240, 280)
+		}
+
+		var updateProvPanelPos = function () {
+			var node = provPanelRef.current
+			var id = provPanelIdRef.current
+			if (node === null || id === null) return
+			var row = provRowRefs.current[id]
+			if (row === undefined || row === null) return
+			var rect = row.getBoundingClientRect()
+			provRowRectRef.current = rect
+			var width = node.offsetWidth > 0 ? node.offsetWidth : 240
+			var height = node.offsetHeight > 0 ? node.offsetHeight : 280
+			var next = provPanelPosOf(rect, width, height)
+			setProvPanelPos(function (prev) {
+				if (prev !== null && prev.left === next.left && prev.top === next.top && prev.side === next.side) return prev
+				return next
+			})
+		}
+		React.useEffect(function () { cardOpenRef.current = card !== null }, [card])
+		React.useLayoutEffect(function () {
+			if (provPanel === null) { setProvPanelPos(null); return undefined }
+			updateProvPanelPos()
+			return undefined
+		}, [provPanel === null ? null : provPanel.id, viewport.w, viewport.h, provPanelDraft, provPanelBusy, provPanelError, provPanelWarn, provPanelPos === null])
+		// 左栏滚动时面板跟着那一行重新对齐（否则会停在旧位置）
+		React.useEffect(function () {
+			var node = sideListRef.current
+			if (node === null) return undefined
+			var onScroll = function () { updateProvPanelPos() }
+			node.addEventListener('scroll', onScroll)
+			return function () { node.removeEventListener('scroll', onScroll) }
+		}, [provPanel === null ? null : provPanel.id])
+		// 弹窗关闭时收起面板
+		React.useEffect(function () {
+			if (props.visible === true) return
+			closeProvPanel()
+		}, [props.visible])
+		var onProvPanelChange = function (field, value) {
+			setProvPanelDraft(function (prev) {
+				var next = Object.assign({}, prev === null ? {} : prev)
+				next[field] = value
+				return next
+			})
+			setProvPanelError(null)
+			setProvPanelSaved(false)
+		}
 		// 换提供商 / 改搜索词后，旧的悬浮卡上下文已失效。
 		React.useEffect(function () {
 			clearCardTimers()
@@ -1969,6 +2397,79 @@ function strArray(value) {
 			})
 		}
 
+		// 保存提供商的修改：改了 id ⇒ 先 rename，成功后再 edit（rename 失败就停下，绝不继续 edit）。
+		// 保存提供商的修改：改了 id ⇒ 先 rename，成功后再 edit（rename 失败就停下，绝不继续 edit）。
+		var saveProvPanel = function () {
+			if (provPanelBusy) return
+			var id = provPanelIdRef.current
+			var draft = provPanelDraft
+			if (id === null || draft === null) return
+			var orig = provPanelOrigRef.current === null ? {} : provPanelOrigRef.current
+			var newId = String(draft.id === undefined ? '' : draft.id).trim()
+			var displayName = String(draft.displayName === undefined ? '' : draft.displayName).trim()
+			var baseURL = String(draft.baseURL === undefined ? '' : draft.baseURL).trim()
+			var apiKeyEnv = String(draft.apiKeyEnv === undefined ? '' : draft.apiKeyEnv).trim()
+			var api = typeof draft.api === 'string' && draft.api !== '' ? draft.api : PROVIDER_APIS[0].id
+			if (displayName === '') { setProvPanelError(TEXT.errProviderDisplayName); return }
+			if (newId === '') { setProvPanelError(TEXT.errProviderId); return }
+			if (baseURL !== '' && !/^https?:\/\//i.test(baseURL)) { setProvPanelError(TEXT.errBaseURL); return }
+			setProvPanelBusy(true)
+			setProvPanelError(null)
+			setProvPanelWarn(null)
+			setProvPanelSaved(false)
+			// patch 只带「有值或被改过」的字段：宿主对空串会直接拒（INVALID_BASE_URL / INVALID_API_KEY_ENV）。
+			var patch = { displayName: displayName, api: api }
+			if (baseURL !== '' || baseURL !== String(orig.baseURL === undefined ? '' : orig.baseURL)) patch.baseURL = baseURL
+			if (apiKeyEnv !== '' || apiKeyEnv !== String(orig.apiKeyEnv === undefined ? '' : orig.apiKeyEnv)) patch.apiKeyEnv = apiKeyEnv
+			var renameWarning = null
+			var renameStep = newId === id
+				? Promise.resolve(null)
+				: fetchJson(API_PROVIDER_RENAME, { method: 'POST', body: { id: id, newId: newId } }).then(function (data) {
+					if (!isRecord(data) || data.ok !== true) {
+						var error = new Error(isRecord(data) && typeof data.message === 'string' ? data.message : '宿主拒绝了这次改名')
+						error.code = isRecord(data) && typeof data.code === 'string' ? data.code : 'RENAME_FAILED'
+						throw error
+					}
+					return data
+				})
+			renameStep.then(function (data) {
+				if (data !== null) {
+					// 改名已落盘 ⇒ 当前面板对应的 id 换成新的（重试时只补 edit）。
+					provPanelIdRef.current = newId
+					if (data.defaultModelReferences === true) {
+						renameWarning = TEXT.provPanelRenameNote
+						setProvPanelWarn(renameWarning)
+					}
+				}
+				return fetchJson(API_PROVIDER_EDIT, { method: 'POST', body: { id: newId, patch: patch } })
+		}).then(function (data) {
+				if (!isRecord(data) || data.ok !== true) {
+					var error = new Error(isRecord(data) && typeof data.message === 'string' ? data.message : '宿主拒绝了这次修改')
+					error.code = isRecord(data) && typeof data.code === 'string' ? data.code : 'EDIT_FAILED'
+					throw error
+				}
+				if (!mountedRef.current) return
+				setProvPanelBusy(false)
+				setProvPanelSaved(true)
+				if (pickedId === id) setPickedId(newId)
+				if (props.onRefreshCatalog) props.onRefreshCatalog()
+				if (renameWarning === null) {
+					closeProvPanel()
+				} else {
+					// 改名提示要留在面板里给用户看到 ⇒ 这里不自动关闭。
+					setProvPanelSaved(true)
+				}
+		}, function (error) {
+				if (!mountedRef.current) return
+				setProvPanelBusy(false)
+				setProvPanelError((error && error.code ? error.code + '：' : '') + errorMessage(error))
+		}).catch(function (error) {
+				if (!mountedRef.current) return
+				setProvPanelBusy(false)
+				setProvPanelError((error && error.code ? error.code + '：' : '') + errorMessage(error))
+		})
+		}
+
 		// 删除 pending 草稿（只对 pending 生效，真实 provider 会被宿主拒绝）
 		var removePendingProvider = function (providerId) {
 			fetchJson(API_PROVIDER, { method: 'POST', body: { id: providerId, remove: true } }).then(function () {
@@ -1981,17 +2482,30 @@ function strArray(value) {
 			})
 		}
 
-		// 获取模型：候选默认**全部勾选**（用户点名要“取消全选”，说明默认是全选）
+		// 获取模型（合并语义）：该渠道**已在列表里**的模型默认勾选且置灰，不会因这次确定被移除；
+		// 只有新出现的候选默认不勾选 —— 确定时只把新增选中的发出去（mode: merge）。
 		var startDiscover = function (providerId) {
 			var provider = null
 			for (var i = 0; i < providers.length; i++) if (providers[i].id === providerId) provider = providers[i]
+			// 折叠区（只有 catalog、没有模型）里也可能有同名渠道 —— 一起算进来。
+			for (var hidx = 0; hidx < hiddenProviders.length; hidx++) if (hiddenProviders[hidx].id === providerId && provider === null) provider = hiddenProviders[hidx]
+			// 该渠道现有的模型 id 集合 = “已在列表”。
+			var existingIds = {}
+			var hasExisting = false
+			if (provider && Array.isArray(provider.models)) {
+				for (var eidx = 0; eidx < provider.models.length; eidx++) {
+					var em = provider.models[eidx]
+					if (em && typeof em.id === 'string' && em.id !== '') { existingIds[em.id] = true; hasExisting = true }
+				}
+			}
 			// Bug 2（真机复现）：必须带 baseURL —— 没有出厂目录的渠道只能从 endpoint 发现模型。
 			var body = { provider: providerId }
 			if (provider && typeof provider.baseURL === 'string' && provider.baseURL !== '') body.baseURL = provider.baseURL
 			if (provider && provider.api) body.api = provider.api
 			if (provider && provider.apiKeyEnv) body.apiKeyEnv = provider.apiKeyEnv
 			setPanelMode('discover')
-			setDiscover({ provider: providerId, loading: true, error: null, models: [], query: '' })
+			setMergeNote(null)
+			setDiscover({ provider: providerId, loading: true, error: null, saving: false, models: [], query: '' })
 			fetchJson(API_DISCOVER, { method: 'POST', body: body }).then(function (data) {
 				if (!isRecord(data) || data.ok !== true) throw new Error(isRecord(data) && typeof data.message === 'string' ? data.message : '获取模型失败')
 				var list = Array.isArray(data.models) ? data.models : []
@@ -2008,34 +2522,59 @@ function strArray(value) {
 						contextWindow: isRecord(item) ? item.contextWindow : undefined,
 						maxTokens: isRecord(item) ? item.maxTokens : undefined,
 						inputModalities: isRecord(item) && Array.isArray(item.inputModalities) ? item.inputModalities : undefined,
-						selected: true
+						// 已在列表 ⇒ 保持勾选（置灰只读）。
+						// 全新渠道（当前 0 个模型）⇒ 维持原行为：候选默认全选（添加提供商流程不变）。
+						// 已有模型的渠道 ⇒ 新增候选默认不勾选，避免一次误操作塞进一堆模型。
+						existing: existingIds[id] === true,
+						selected: existingIds[id] === true || hasExisting === false
 					})
 				}
-				setDiscover({ provider: providerId, loading: false, error: null, models: models, query: '' })
+				setDiscover({ provider: providerId, loading: false, error: null, saving: false, models: models, query: '' })
 			}, function (error) {
-				setDiscover({ provider: providerId, loading: false, error: (error && error.code ? error.code + '：' : '') + errorMessage(error), models: [], query: '' })
+				setDiscover({ provider: providerId, loading: false, error: (error && error.code ? error.code + '：' : '') + errorMessage(error), saving: false, models: [], query: '' })
 			}).catch(function (error) {
 				// 宿主业务失败是 HTTP 200 + {ok:false}，上面的 onOk 会 throw ⇒ 必须在这里兜住，
 				// 否则 loading 永远停在 true（真机「一直加载」的根因）。
 				if (!mountedRef.current) return
-				setDiscover({ provider: providerId, loading: false, error: (error && error.code ? error.code + '：' : '') + errorMessage(error), models: [], query: '' })
+				setDiscover({ provider: providerId, loading: false, error: (error && error.code ? error.code + '：' : '') + errorMessage(error), saving: false, models: [], query: '' })
 			})
 		}
 
 		var patchDiscover = function (patch) {
 			setDiscover(function (prev) { return prev === null ? prev : Object.assign({}, prev, patch) })
 		}
+		// 全选 / 取消全选：只影响**新增**候选；“已在列表”的行始终保持勾选（它们不会重发）。
 		var setDiscoverSelected = function (ids) {
 			setDiscover(function (prev) {
 				if (prev === null) return prev
-				return Object.assign({}, prev, { models: prev.models.map(function (model) { return { id: model.id, name: model.name, selected: ids === null ? false : ids.indexOf(model.id) >= 0 } }) })
+				return Object.assign({}, prev, { models: prev.models.map(function (model) {
+					if (model.existing === true) return Object.assign({}, model, { selected: true })
+					return Object.assign({}, model, { selected: ids === null ? false : ids.indexOf(model.id) >= 0 })
+				}) })
 			})
 		}
+		// 确定（合并语义）：只把**新增且勾中**的模型发出去（mode: merge）。
+		// 已在列表里的行不重发 —— 后端按 id 去重、已有条目整条原样保留，所以原有模型不会被清掉。
 		var confirmDiscover = function () {
 			if (discover === null) return
-			var picked = discover.models.filter(function (model) { return model.selected })
-			if (picked.length === 0) { patchDiscover({ error: TEXT.discoverNeedOne }); return }
-			patchDiscover({ error: null })
+			if (discover.saving === true) return
+			var picked = discover.models.filter(function (model) { return model.selected && model.existing !== true })
+			// 该渠道已在列表里的模型数（no-op 与计数提示都用它）。
+			var existingCount = discover.models.filter(function (model) { return model.existing === true }).length
+			// 一个都没勾 ⇒ 该渠道会没有模型 ⇒ 明确报错（这是「至少勾选一个」唯一还适用的场景）。
+			if (picked.length === 0 && existingCount === 0) {
+				patchDiscover({ error: TEXT.discoverNeedOne })
+				return
+			}
+			// 没有新增选中但已有模型 ⇒ no-op：不写盘、不报错，已有模型原样保留。
+			if (picked.length === 0) {
+				var noopNote = TEXT.discoverNoop + TEXT.discoverNoopKept + String(existingCount) + TEXT.discoverNoopKeptTail
+				setMergeNote(noopNote)
+				setPanelMode('list')
+				setDiscover(null)
+				return
+			}
+			patchDiscover({ error: null, saving: true })
 			// 契约 v1.3：models 是对象数组（含 name/contextWindow/maxTokens/input）。
 			var payload = picked.map(function (model) {
 				var row = { id: model.id }
@@ -2045,16 +2584,28 @@ function strArray(value) {
 				if (Array.isArray(model.inputModalities)) row.input = model.inputModalities
 				return row
 			})
-			fetchJson(API_PROVIDER_MODELS, { method: 'POST', body: { provider: discover.provider, models: payload } }).then(function (data) {
+			// 失败时回滚到“确定前”的勾选状态。
+			var rollback = discover.models.map(function (model) { return Object.assign({}, model) })
+			fetchJson(API_PROVIDER_MODELS, { method: 'POST', body: { provider: discover.provider, mode: 'merge', models: payload } }).then(function (data) {
 				if (!isRecord(data) || data.ok !== true) throw new Error(isRecord(data) && typeof data.message === 'string' ? data.message : '写入模型失败')
+			// 响应 = { ok, added:[ids], kept:[ids], count, declaredAfter }
+				var addedCount = Array.isArray(data.added) ? data.added.length : payload.length
+				var keptCount = Array.isArray(data.kept) ? data.kept.length : existingCount
+				setMergeNote(TEXT.discoverAdded + String(addedCount) + TEXT.discoverKept + String(keptCount))
 				setPanelMode('list')
 				setDiscover(null)
 				if (props.onRefreshCatalog) props.onRefreshCatalog()
 			}, function (error) {
-				patchDiscover({ error: (error && error.code ? error.code + '：' : '') + errorMessage(error) })
+				setDiscover(function (prev) {
+					if (prev === null) return prev
+					return Object.assign({}, prev, { models: rollback, saving: false, error: (error && error.code ? error.code + '：' : '') + errorMessage(error) })
+				})
 			}).catch(function (error) {
 				if (!mountedRef.current) return
-				patchDiscover({ error: (error && error.code ? error.code + '：' : '') + errorMessage(error) })
+				setDiscover(function (prev) {
+					if (prev === null) return prev
+					return Object.assign({}, prev, { models: rollback, saving: false, error: (error && error.code ? error.code + '：' : '') + errorMessage(error) })
+				})
 			})
 		}
 
@@ -2292,7 +2843,10 @@ function strArray(value) {
 				return model.id.toLowerCase().indexOf(needle) >= 0 || model.name.toLowerCase().indexOf(needle) >= 0
 			})
 			var selectedCount = discover.models.filter(function (model) { return model.selected }).length
-			var allIds = discover.models.map(function (model) { return model.id })
+			var existingCount = discover.models.filter(function (model) { return model.existing === true }).length
+			var newSelectedCount = discover.models.filter(function (model) { return model.selected && model.existing !== true }).length
+			// 全选只针对新增候选（已在列表的行本来就勾着）。
+			var allIds = discover.models.filter(function (model) { return model.existing !== true }).map(function (model) { return model.id })
 			return h('div', { className: 'mh-page', 'data-model-hub': 'discover' }, [
 				h('div', { key: 'head', className: 'mh-pageHead' }, [
 					h('span', { key: 't', className: 'mh-pageTitle' }, TEXT.discoverTitle + ' · ' + discover.provider),
@@ -2324,35 +2878,51 @@ function strArray(value) {
 						h('span', { key: 'c', className: 'mh-toolbarCount', 'data-model-hub': 'discover-count' }, TEXT.discoverSelected + selectedCount + ' / ' + discover.models.length)
 					]),
 					h('div', { key: 'hint', className: 'mh-formHint', style: { paddingLeft: '0' } }, TEXT.discoverHint),
+					h('div', { key: 'meta', className: 'mh-cardNote', style: { paddingLeft: '0', marginTop: '-4px' }, 'data-model-hub': 'discover-meta' },
+						TEXT.discoverMeta + String(newSelectedCount) + TEXT.discoverMetaKept + String(existingCount) + TEXT.discoverMetaTail),
 					discover.error ? h('div', { key: 'err', className: 'mh-pageError', role: 'alert' }, discover.error) : null,
 					discover.loading
 						? h('div', { key: 'load', className: 'mh-empty' }, [h(Spinner, { key: 's' }), h('span', { key: 't' }, TEXT.discoverLoading)])
 						: shown.length === 0
 							? h('div', { key: 'none', className: 'mh-empty' }, TEXT.discoverEmpty)
 							: h('div', { key: 'list', className: 'mh-discoverList', 'data-model-hub': 'discover-list' }, shown.map(function (model) {
-								return h('label', { key: model.id, className: 'mh-discoverRow', 'data-model-hub': 'discover-row' }, [
-									h(Check, {
-										key: 'c',
-										label: '',
-										title: model.id,
-										checked: model.selected,
-										onChange: function () {
-											setDiscover(function (prev) {
-												if (prev === null) return prev
-												return Object.assign({}, prev, {
-													models: prev.models.map(function (item) { return item.id === model.id ? { id: item.id, name: item.name, contextWindow: item.contextWindow, maxTokens: item.maxTokens, inputModalities: item.inputModalities, selected: !item.selected } : item })
-												})
+									var isExisting = model.existing === true
+									return h('label', {
+										key: model.id,
+										className: 'mh-discoverRow',
+										'data-model-hub': 'discover-row',
+										'data-existing': isExisting ? 'true' : 'false'
+									}, [
+										h(Check, {
+											key: 'c',
+											label: '',
+											title: model.id,
+											checked: model.selected,
+											// 已在列表 ⇒ 置灰只读（勾选状态保持为真，且不会重发）。
+											disabled: isExisting,
+											onChange: function () {
+												if (isExisting) return
+												setDiscover(function (prev) {
+													if (prev === null) return prev
+													return Object.assign({}, prev, {
+														models: prev.models.map(function (item) {
+															if (item.id !== model.id) return item
+															if (item.existing === true) return item
+															return Object.assign({}, item, { selected: !item.selected })
+														})
+													})
 											})
 										}
 									}),
 									h('span', { key: 'id', className: 'mh-discoverId' }, model.id),
-									model.name !== model.id ? h('span', { key: 'n', className: 'mh-discoverName' }, model.name) : null
+									model.name !== model.id ? h('span', { key: 'n', className: 'mh-discoverName' }, model.name) : null,
+									isExisting ? h('span', { key: 'e', className: 'mh-badge mh-discoverExisting', 'data-model-hub': 'discover-existing' }, TEXT.discoverAlreadyListed) : null
 								])
 							}))
 				]),
 				h('div', { key: 'foot', className: 'mh-pageFoot' }, [
 					h('button', { key: 'c', type: 'button', className: 'mh-btn', 'data-model-hub': 'discover-cancel', onClick: function () { setPanelMode('list'); setDiscover(null) } }, TEXT.cancel),
-					h('button', { key: 's', type: 'button', className: 'mh-btn mh-btnPrimary', 'data-model-hub': 'discover-confirm', onClick: confirmDiscover }, TEXT.confirm)
+					h('button', { key: 's', type: 'button', className: 'mh-btn mh-btnPrimary', 'data-model-hub': 'discover-confirm', disabled: discover.saving === true, onClick: confirmDiscover }, discover.saving === true ? TEXT.discoverSaving : TEXT.confirm)
 				])
 			])
 		}
@@ -2553,7 +3123,13 @@ function strArray(value) {
 				onDragOver: function (event) { onDragOver(event, provider) },
 				onDrop: function (event) { onDrop(event, provider) },
 				onDragEnd: onDragEnd,
-				onMouseEnter: function () { if (card !== null) setCard(null) }
+				ref: function (element) { if (element === null) delete provRowRefs.current[provider.id]; else provRowRefs.current[provider.id] = element },
+				onMouseEnter: function () {
+					// 能力卡与提供商面板互斥：鼠标移到提供商行 ⇒ 能力卡先关。
+					if (card !== null) setCard(null)
+					scheduleOpenProvPanel(provider)
+				},
+				onMouseLeave: function (event) { scheduleCloseProvPanel(event) }
 			}, [
 				h('span', { key: 'bar', className: 'mh-provBar' }),
 				h('span', { key: 'n', className: 'mh-provName' }, provider.name),
@@ -2601,7 +3177,7 @@ function strArray(value) {
 			var liveModel = cardModel || card.model
 			var liveProvider = cardProvider || card.provider
 			var isCurrentModel = currentKey === card.key
-			cardNode = h(HubBoundary, { fallback: null }, h(HoverCard, { key: card.key,
+			cardNode = h(HubBoundary, { fallback: null, propagateError: MH_TEST_CRASH_ON === true }, h(HoverCard, { key: card.key,
 				cardRef: cardRef,
 				left: cardPos.left,
 				top: cardPos.top,
@@ -2623,6 +3199,30 @@ function strArray(value) {
 				onMouseEnter: function () { clearCardTimers() },
 				onMouseLeave: function () { scheduleCloseCard() }
 			}))
+		}
+
+		// 提供商悬浮编辑面板节点（portal 到 document.body）。
+		var provPanelNode = null
+		if (provPanel !== null && provPanelDraft !== null) {
+			provPanelNode = createPortal(h(HubBoundary, { fallback: null }, h(ProviderEditPanel, {
+				key: provPanel.id,
+				panelRef: provPanelRef,
+				left: provPanelPos !== null ? provPanelPos.left : provPanelTempPos().left,
+				top: provPanelPos !== null ? provPanelPos.top : provPanelTempPos().top,
+				side: provPanelPos !== null ? provPanelPos.side : provPanelTempPos().side,
+				provider: provPanel,
+				draft: provPanelDraft,
+				protocols: providerProtocols,
+				busy: provPanelBusy,
+				error: provPanelError,
+				warn: provPanelWarn,
+				saved: provPanelSaved,
+				onChange: onProvPanelChange,
+				onSave: saveProvPanel,
+				onCancel: function () { if (!provPanelBusy) closeProvPanel() },
+				onMouseEnter: function () { clearProvCloseTimer() },
+				onMouseLeave: function (event) { scheduleCloseProvPanel(event) }
+			})) , document.body)
 		}
 
 		var strips = []
@@ -2694,7 +3294,7 @@ function strArray(value) {
 									h('span', { key: 'n', className: 'mh-skelBar', style: { flex: '1' } })
 								])
 							})) : h('div', { key: 'empty', className: 'mh-empty' }, TEXT.noModels))
-							: h('div', { key: 'list', className: 'mh-sideList', role: 'tablist', 'aria-label': TEXT.providerColumn },
+							: h('div', { key: 'list', className: 'mh-sideList', ref: sideListRef, role: 'tablist', 'aria-label': TEXT.providerColumn },
 								sideList.concat([h('button', {
 									key: '__add',
 									type: 'button',
@@ -2741,6 +3341,7 @@ function strArray(value) {
 								? '命中 ' + String(currentHitsCount + otherHitCount) + ' / 共 ' + String(totalModelCount) + ' 个模型'
 								: active === null ? '' : '共 ' + String(active.models.length) + ' 个模型')
 						]),
+						mergeNote ? h('div', { key: 'mn', className: 'mh-mergeNote', 'data-model-hub': 'merge-note' }, mergeNote) : null,
 						strips.length > 0 ? h('div', { key: 'strips' }, strips) : null,
 						h('div', { key: 'wrap', className: 'mh-listWrap' }, mainBody)
 					]),
@@ -2760,7 +3361,9 @@ function strArray(value) {
 				// 全屏页（添加提供商 / 获取模型）：position:absolute;inset:0，包含块是 .mh-panel
 				pageNode
 			]),
-			cardNode
+			cardNode,
+			// 提供商悬浮编辑面板：portal 到 body（fixed + z-index 1300 ⇒ 不会被弹窗遮罩盖住）。
+			provPanelNode
 		])
 	}
 
@@ -2832,7 +3435,10 @@ function strArray(value) {
 		var out = []
 		if (meta.vision) out.push(h('span', { key: 'v', className: 'mh-badge' }, [h(IconEye, { key: 'i', size: 11 }), h('span', { key: 't' }, TEXT.vision)]))
 		var label = contextLabel(meta.contextWindow)
-		if (label !== null) out.push(h('span', { key: 'c', className: 'mh-badge' }, label))
+		if (label !== null) {
+			var labelTitle = contextLabelTitle(meta.contextWindow)
+			out.push(h('span', { key: 'c', className: 'mh-badge', title: labelTitle, 'aria-label': labelTitle }, label))
+		}
 		if (Array.isArray(meta.efforts) && meta.efforts.length > 0) {
 			var hit = null
 			for (var i = 0; i < meta.efforts.length; i++) if (meta.efforts[i].id === meta.defaultEffort) hit = meta.efforts[i]
@@ -3160,6 +3766,19 @@ function useDirectorySnapshot(store) {
 			var register = function (models, sessions) {
 				ctx.slots.inject('conversation.input.model', function () {
 					var dispose
+					// 幂等防护：同一页面里这份 bundle 被求值两次（或槽位声明重放）时，已有一个 live 的
+					// -100 条目在跑；single 槽位同 priority 再注册会抛 “already has a registration”。
+					// 此时让既有条目继续工作、自己退成 no-op，而不是把一次良性的重复装载报成“插件失败”。
+					try {
+						var winners = typeof ctx.slots.entriesOfSlot === 'function' ? ctx.slots.entriesOfSlot('conversation.input.model') : []
+						for (var wi = 0; wi < (winners || []).length; wi++) {
+							var w = winners[wi]
+							if (w && w.options && w.options.priority === SHADOW_PRIORITY) {
+								mhDiag('slot-register-skipped', null, { note: 'already shadowed at -100 (double evaluation?)' })
+								return function () {}
+							}
+						}
+					} catch (ignored) {}
 					try {
 						dispose = ctx.slots.register({
 							name: 'conversation.input.model',
@@ -3206,7 +3825,12 @@ function useDirectorySnapshot(store) {
 						}
 						mhDiag('slot-registered')
 					} catch (error) {
-						mhDiag('slot-register-failed', error)
+						// 与上面的幂等检查同因：撞上“已有一个 -100 条目”是良性重复装载，不算失败。
+						if (error && typeof error.message === 'string' && error.message.indexOf('already has a registration') >= 0) {
+							mhDiag('slot-register-skipped', null, { note: error.message })
+						} else {
+							mhDiag('slot-register-failed', error)
+						}
 						dispose = undefined
 					}
 					return function () { if (dispose) dispose() }

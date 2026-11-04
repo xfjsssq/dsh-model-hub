@@ -8,7 +8,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -219,16 +219,25 @@ function makeHost(options) {
     },
   };
 
+  // profile 的 cordis.patch.yml（只给 defaultModelReferences 报告信号用）。
+  // 放不放 agent-default-model 由 options.patchText 决定。
+  const profileDir = mkdtempSync(join(tmpdir(), 'dsh-model-hub-profile-'));
+  const patchText = (options || {}).patchText;
+  if (typeof patchText === 'string') {
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), patchText, 'utf8');
+  }
+
   const ctx = {
     get(name) {
       if (name === 'settings') return settings;
       if (name === 'llm') return llm;
       if (name === 'credentials') return { async resolve(ref) { return ref === 'MISSING' ? undefined : { value: 'sk-test' } } };
+      if (name === 'profileContext') return { dir: profileDir };
       return undefined;
     },
   };
 
-  return { ctx, cfg, live, audit, counts, getRevision: () => revision };
+  return { ctx, cfg, live, audit, counts, profileDir, getRevision: () => revision };
 }
 
 function fakeReq(method, body, headers) {
@@ -520,7 +529,7 @@ test('revision 冲突会被重试并最终成功', async () => {
 
 // ---------------------------------------------------------------- routes
 
-test('routes：注册 11 条（v1.5 又加了 client-state），dispose 后清空', async () => {
+test('routes：注册 13 条（v1.6 又加了 provider/edit 与 provider/rename），dispose 后清空', async () => {
   freshPrefsHome();
   const host = makeHost();
   const m = mount(host.ctx);
@@ -535,8 +544,10 @@ test('routes：注册 11 条（v1.5 又加了 client-state），dispose 后清�
       '/model-hub/api/provider',
       '/model-hub/api/provider-templates',
       '/model-hub/api/provider/discover',
+      '/model-hub/api/provider/edit',
       '/model-hub/api/provider/model-remove',
       '/model-hub/api/provider/models',
+      '/model-hub/api/provider/rename',
       '/model-hub/api/selftest',
     ],
   );
@@ -1135,27 +1146,45 @@ test('★ POST /provider/models：待建草稿 + 勾选模型一次性原子落�
   m.dispose();
 });
 
-test('POST /provider/models：已存在的 provider 覆盖写；清空对自定义路由被拦、对出厂路由合法', async () => {
+test('POST /provider/models：replace 模式覆盖写；清空对自定义路由被拦、对出厂路由合法', async () => {
   freshPrefsHome();
   const host = makeHost();
   const m = mount(host.ctx);
   const body = (await m.send('POST', '/model-hub/api/provider/models', {
     provider: 'beta',
+    mode: 'replace',
     models: [{ id: 'm-glm' }, { id: 'm-glm-flash', maxTokens: 4096 }],
   })).json();
   assert.equal(body.ok, true, JSON.stringify(body));
   assert.equal(body.created, false);
+  assert.equal(body.mode, 'replace');
   assert.deepEqual(host.cfg.providers.beta.models.map((x) => x.id), ['m-glm', 'm-glm-flash']);
   assert.deepEqual(body.declaredAfter.models.map((x) => x.id), ['m-glm', 'm-glm-flash']);
 
-  const clear = await m.send('POST', '/model-hub/api/provider/models', { provider: 'beta', models: [] });
+  const clear = await m.send('POST', '/model-hub/api/provider/models', { provider: 'beta', mode: 'replace', models: [] });
   assert.equal(clear.state.status, 400);
   assert.equal(clear.json().code, 'MODELS_REQUIRED', 'llm-pi-ai 拒绝无模型的自定义路由');
 
-  const builtin = (await m.send('POST', '/model-hub/api/provider/models', { provider: 'delta', models: [] })).json();
+  const builtin = (await m.send('POST', '/model-hub/api/provider/models', { provider: 'delta', mode: 'replace', models: [] })).json();
   assert.equal(builtin.ok, true, '出厂目录路由清空 = 回落到目录模型');
   assert.equal(builtin.count, 0);
   assert.equal(Object.hasOwn(host.cfg.providers.delta, 'models'), false, '清空 = unset models');
+  m.dispose();
+});
+
+test('★ POST /provider/models：默认是 merge（不传 mode 也不会清空已有模型）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const body = (await m.send('POST', '/model-hub/api/provider/models', {
+    provider: 'beta',
+    models: [{ id: 'm-glm-flash', maxTokens: 4096 }],
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.mode, 'merge', '★ 新默认是 merge');
+  assert.deepEqual(body.added, ['m-glm-flash']);
+  assert.deepEqual(body.kept, ['m-glm']);
+  assert.deepEqual(host.cfg.providers.beta.models.map((x) => x.id), ['m-glm', 'm-glm-flash'], '★ 原有模型不被清掉');
   m.dispose();
 });
 
@@ -1175,8 +1204,12 @@ test('POST /provider/models：models 校验与缺字段的明确 code', async ()
 
   const orphan = (await m.send('POST', '/model-hub/api/provider/models', { provider: 'brand-new', models: [{ id: 'a' }] })).json();
   assert.equal(orphan.code, 'PROVIDER_FIELDS_REQUIRED', '未声明且无草稿 → 必须给 provider 字段');
-  const emptyOrphan = (await m.send('POST', '/model-hub/api/provider/models', { provider: 'brand-new', models: [] })).json();
-  assert.equal(emptyOrphan.code, 'MODELS_REQUIRED');
+  const emptyOrphan = (await m.send('POST', '/model-hub/api/provider/models', { provider: 'brand-new', mode: 'replace', models: [] })).json();
+  assert.equal(emptyOrphan.code, 'MODELS_REQUIRED', 'replace 模式下清空仍被拦（llm-pi-ai 硬约束）');
+  const emptyMerge = (await m.send('POST', '/model-hub/api/provider/models', { provider: 'brand-new', mode: 'merge', models: [] })).json();
+  assert.equal(emptyMerge.ok, true, '★ merge 模式下空数组是 no-op，不报错');
+  assert.equal(emptyMerge.noop, true);
+  assert.equal(Object.hasOwn(host.cfg.providers, 'brand-new'), false, '★ no-op 不落盘');
   m.dispose();
 });
 
@@ -1700,6 +1733,359 @@ test('★ selftest 会还原被 unset 的 image* 与 reasoningEfforts（键集�
   // 用 deepEqual（不比较键顺序）：被删除再写回的键一定会被追加到末尾，
   // 所以这种情况只能保证『配置等价』，不能保证 YAML 字节序相同。
   assert.deepEqual(after, before, '被删的字段必须原值写回');
+});
+
+
+// ---------------------------------------------------------------- task-1：provider/models 的 merge 模式
+
+test('★ merge 模式：已有模型整条原样保留（连我们不认识的字段也不丢），只追加新 id', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  // 给 beta 的第一个模型塞一个『我们不认识的字段』，用来证明 merge 不会投影/重写已有条目。
+  host.cfg.providers.beta.models[0].myUnknownField = { keep: 'me' };
+  host.cfg.providers.beta.models[0].compat = { custom: 'x' };
+  const before = JSON.parse(JSON.stringify(host.cfg.providers.beta.models[0]));
+
+  const body = (await m.send('POST', '/model-hub/api/provider/models', {
+    provider: 'beta',
+    mode: 'merge',
+    models: [{ id: 'm-glm', name: '会被忽略的新名字' }, { id: 'm-new', name: 'New' }],
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.deepEqual(body.added, ['m-new'], '只有新 id 进 added');
+  assert.deepEqual(body.kept, ['m-glm'], '原本就有的进 kept');
+  assert.equal(body.count, 2);
+  assert.equal(body.mode, 'merge');
+  assert.equal(body.noop, false);
+
+  const models = host.cfg.providers.beta.models;
+  assert.deepEqual(models.map((x) => x.id), ['m-glm', 'm-new'], '原有在前、新增在后');
+  assert.deepEqual(models[0], before, '★ 已有条目整条逐字节保留（不被候选覆盖）');
+  assert.deepEqual(models[1], { id: 'm-new', name: 'New' });
+  m.dispose();
+});
+
+test('★ merge 模式：重复 id 以旧为准（候选不能覆盖已有条目）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  host.cfg.providers.alpha.models[0].myUnknownField = 'keep';
+  const before = JSON.parse(JSON.stringify(host.cfg.providers.alpha.models[0]));
+
+  const body = (await m.send('POST', '/model-hub/api/provider/models', {
+    provider: 'alpha',
+    mode: 'merge',
+    models: [{ id: 'm-flash-1017', name: '改名字', contextWindow: 1, maxTokens: 1, input: ['image', 'text'] }],
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.deepEqual(body.added, [], '已有 id 不算新增');
+  assert.deepEqual(body.kept, ['m-flash-1017']);
+  assert.equal(body.count, 1, '数量不变');
+  assert.deepEqual(host.cfg.providers.alpha.models, [before], '★ 候选里的同 id 条目被忽略，原条目原样保留');
+  m.dispose();
+});
+
+test('merge 模式：候选里重复的 id 被明确拒绝（DUPLICATE_MODEL，沿用既有校验）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const body = (await m.send('POST', '/model-hub/api/provider/models', {
+    provider: 'alpha',
+    mode: 'merge',
+    models: [{ id: 'dup', name: '第一' }, { id: 'dup', name: '第二' }],
+  })).json();
+  assert.equal(body.code, 'DUPLICATE_MODEL', '候选内部的重复 id 仍是明确拒绝，不静默吞掉');
+  m.dispose();
+});
+
+test('★ merge 模式：models 为空数组 = no-op（不写盘、count 返回现状、绝不清空渠道）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const before = JSON.parse(JSON.stringify(host.cfg.providers.beta.models));
+  const mutateBefore = host.counts.mutate;
+
+  const body = (await m.send('POST', '/model-hub/api/provider/models', {
+    provider: 'beta',
+    mode: 'merge',
+    models: [],
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body), '★ 空数组不是错误（用户可能只是打开面板确认一下）');
+  assert.equal(body.noop, true);
+  assert.deepEqual(body.added, []);
+  assert.deepEqual(body.kept, ['m-glm'], 'kept 报告现状');
+  assert.equal(body.count, 1, 'count 返回现状');
+  assert.deepEqual(body.ops, [], '★ 没有写盘操作');
+  assert.equal(host.counts.mutate, mutateBefore, '★ 一次 mutate 都不该发生');
+  assert.deepEqual(host.cfg.providers.beta.models, before, '★ 渠道绝不能被写空');
+  m.dispose();
+});
+
+test('★ merge 模式：出厂目录路由（models 来自继承层）也能合并，且不会写空', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const body = (await m.send('POST', '/model-hub/api/provider/models', {
+    provider: 'inherited',
+    mode: 'merge',
+    models: [{ id: 'new-one' }],
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  // 继承层声明不算『profile 已有』：所以 new-one 是新增，而继承层的 inh-1 不被搬进 profile。
+  assert.deepEqual(body.added, ['new-one']);
+  assert.deepEqual(body.kept, []);
+  assert.equal(body.count, 1);
+  assert.deepEqual(host.cfg.providers.inherited.models.map((x) => x.id), ['new-one']);
+  m.dispose();
+});
+
+test('未知的 mode 值被明确拒绝（INVALID_MODE）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const bad = await m.send('POST', '/model-hub/api/provider/models', { provider: 'beta', mode: 'nope', models: [{ id: 'x' }] });
+  assert.equal(bad.state.status, 400);
+  assert.equal(bad.json().code, 'INVALID_MODE');
+  m.dispose();
+});
+
+test('merge 模式的未声明 provider：空数组仍是 no-op，不报错也不写盘', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const body = (await m.send('POST', '/model-hub/api/provider/models', {
+    provider: 'brand-new',
+    mode: 'merge',
+    models: [],
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.noop, true);
+  assert.equal(body.count, 0);
+  assert.equal(Object.hasOwn(host.cfg.providers, 'brand-new'), false, '★ 没落盘');
+  m.dispose();
+});
+
+test('★ slot-register-skipped 是白名单内的良性阶段（不带 unknown）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  await m.send('POST', '/model-hub/api/client-state', { stage: 'slot-register-skipped' });
+  const health = (await m.send('GET', '/model-hub/api/health')).json();
+  assert.equal(health.clientState.stage, 'slot-register-skipped');
+  assert.equal(health.clientState.unknown, undefined, '★ 良性跳过不该被标成未知状态');
+  m.dispose();
+});
+
+
+// ---------------------------------------------------------------- task-2：provider/edit 与 provider/rename
+
+test('★ provider/edit：改已声明 provider 的四个字段（行级 set，不碰其它字段）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const before = JSON.parse(JSON.stringify(host.cfg.providers.beta));
+
+  const body = (await m.send('POST', '/model-hub/api/provider/edit', {
+    id: 'beta',
+    patch: { displayName: '新名字', api: 'anthropic-messages', baseURL: 'https://new.invalid/v1', apiKeyEnv: 'BETA_NEW_KEY' },
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.provider, 'beta');
+  assert.equal(body.pending, false);
+  assert.deepEqual(body.patched.sort(), ['api', 'apiKeyEnv', 'baseURL', 'displayName']);
+
+  const after = host.cfg.providers.beta;
+  assert.equal(after.displayName, '新名字');
+  assert.equal(after.api, 'anthropic-messages');
+  assert.equal(after.baseURL, 'https://new.invalid/v1');
+  assert.equal(after.apiKeyEnv, 'BETA_NEW_KEY');
+  assert.deepEqual(after.models, before.models, '★ models 数组绝不能被改');
+  assert.equal(body.declaredAfter.displayName, '新名字', '声明层回执');
+  m.dispose();
+});
+
+test('★ provider/edit：patch 里没出现的字段不许被改动', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const before = JSON.parse(JSON.stringify(host.cfg.providers.beta));
+
+  const body = (await m.send('POST', '/model-hub/api/provider/edit', {
+    id: 'beta',
+    patch: { displayName: '只改名字' },
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  const after = host.cfg.providers.beta;
+  assert.equal(after.displayName, '只改名字');
+  assert.equal(after.api, before.api, '★ api 不许被改');
+  assert.equal(after.baseURL, before.baseURL, '★ baseURL 不许被改');
+  assert.equal(after.apiKeyEnv, before.apiKeyEnv, '★ apiKeyEnv 不许被改');
+  assert.deepEqual(after.models, before.models);
+  m.dispose();
+});
+
+test('provider/edit：非法值给明确 code，且不写盘', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const before = JSON.parse(JSON.stringify(host.cfg.providers.beta));
+  const edit = async (patch) => (await m.send('POST', '/model-hub/api/provider/edit', { id: 'beta', patch })).json();
+
+  assert.equal((await edit({ displayName: '' })).code, 'INVALID_DISPLAY_NAME');
+  assert.equal((await edit({ displayName: 'x'.repeat(500) })).code, 'INVALID_DISPLAY_NAME');
+  assert.equal((await edit({ api: 'nope' })).code, 'INVALID_PROTOCOL');
+  assert.equal((await edit({ baseURL: 'ftp://x' })).code, 'INVALID_BASE_URL');
+  assert.equal((await edit({ baseURL: 'not-a-url' })).code, 'INVALID_BASE_URL');
+  assert.equal((await edit({ apiKeyEnv: '' })).code, 'INVALID_API_KEY_ENV');
+  assert.equal((await edit({ apiKeyEnv: 'not a name' })).code, 'INVALID_API_KEY_ENV');
+  assert.equal((await edit({ apiKeyEnv: '1BAD' })).code, 'INVALID_API_KEY_ENV');
+  assert.equal((await edit({ unknownField: 1 })).code, 'UNSUPPORTED_FIELD', '白名单外的字段被拒');
+
+  const unknown = await m.send('POST', '/model-hub/api/provider/edit', { id: 'no-such', patch: { displayName: 'x' } });
+  assert.equal(unknown.state.status, 400);
+  assert.equal(unknown.json().code, 'UNKNOWN_PROVIDER');
+
+  assert.deepEqual(host.cfg.providers.beta, before, '★ 被拒的请求一律不写盘');
+  m.dispose();
+});
+
+test('★ provider/edit：pending 草稿只改草稿对象，绝不碰 settings', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  await m.send('POST', '/model-hub/api/provider', { id: 'my-gw', displayName: '我的网关', api: 'openai-completions', baseURL: 'https://gw.example/v1', apiKeyEnv: 'MY_GW_KEY' });
+
+  const body = (await m.send('POST', '/model-hub/api/provider/edit', {
+    id: 'my-gw',
+    patch: { displayName: '改过的网关', baseURL: 'https://gw2.example/v1' },
+  })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.pending, true);
+  assert.equal(body.declaredAfter, null, '还没有真实配置可回执');
+  assert.equal(body.draft.displayName, '改过的网关');
+  assert.equal(body.draft.baseURL, 'https://gw2.example/v1');
+  assert.equal(body.draft.api, 'openai-completions', '★ 没给的字段不许变');
+  assert.equal(body.draft.apiKeyEnv, 'MY_GW_KEY', '★ 没给的字段不许变');
+  assert.equal(Object.hasOwn(host.cfg.providers, 'my-gw'), false, '★ 草稿阶段绝不碰 profile');
+
+  const prefs = (await m.send('GET', '/model-hub/api/prefs')).json().prefs;
+  assert.equal(prefs.pendingProviders['my-gw'].displayName, '改过的网关');
+  m.dispose();
+});
+
+test('★ provider/rename：改名后 order / pinned / overrides 联动', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  await m.send('POST', '/model-hub/api/prefs', { order: ['beta', 'alpha'], pinned: ['beta'] });
+  // 造一条 overrides 记录（键是 <provider>/<model>）。
+  await m.send('POST', '/model-hub/api/model', { provider: 'beta', model: 'm-glm', patch: { maxTokens: 4096 } });
+
+  const body = (await m.send('POST', '/model-hub/api/provider/rename', { id: 'beta', newId: 'beta-renamed' })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.provider, 'beta');
+  assert.equal(body.newId, 'beta-renamed');
+  assert.equal(body.renamed, true);
+
+  assert.equal(Object.hasOwn(host.cfg.providers, 'beta'), false, '★ 旧 id 被 unset');
+  assert.equal(Object.hasOwn(host.cfg.providers, 'beta-renamed'), true, '★ 新 id 已写入');
+  assert.deepEqual(host.cfg.providers['beta-renamed'].models.map((x) => x.id), ['m-glm'], '★ 整棵值原样搬过去');
+  assert.equal(host.cfg.providers['beta-renamed'].baseURL, 'https://s.invalid/v1');
+
+  const prefs = (await m.send('GET', '/model-hub/api/prefs')).json().prefs;
+  assert.deepEqual(prefs.order, ['beta-renamed', 'alpha'], '★ order 联动');
+  assert.deepEqual(prefs.pinned, ['beta-renamed'], '★ pinned 联动');
+  assert.equal(Object.hasOwn(prefs.overrides, 'beta/m-glm'), false, '★ 旧 override 键被换掉');
+  assert.equal(Object.hasOwn(prefs.overrides, 'beta-renamed/m-glm'), true, '★ override 键跟着换 id');
+  m.dispose();
+});
+
+test('provider/rename：pending 草稿改名只在 prefs 里换键', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  await m.send('POST', '/model-hub/api/provider', { id: 'my-gw', displayName: '我的网关', api: 'openai-completions', baseURL: 'https://gw.example/v1' });
+
+  const body = (await m.send('POST', '/model-hub/api/provider/rename', { id: 'my-gw', newId: 'my-gw-2' })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.pending, true);
+  assert.equal(body.draft.displayName, '我的网关');
+  const prefs = (await m.send('GET', '/model-hub/api/prefs')).json().prefs;
+  assert.equal(Object.hasOwn(prefs.pendingProviders, 'my-gw'), false);
+  assert.equal(Object.hasOwn(prefs.pendingProviders, 'my-gw-2'), true);
+  assert.equal(Object.hasOwn(host.cfg.providers, 'my-gw-2'), false, '★ 草稿改名绝不写 profile');
+  m.dispose();
+});
+
+test('provider/rename：非法 id / 冲突 / 未知 id 都给明确 code 且不写盘', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  const rename = async (payload) => (await m.send('POST', '/model-hub/api/provider/rename', payload)).json();
+
+  assert.equal((await rename({ id: 'beta', newId: 'Bad_Id' })).code, 'INVALID_PROVIDER_ID');
+  assert.equal((await rename({ id: 'beta', newId: '-bad' })).code, 'INVALID_PROVIDER_ID');
+  assert.equal((await rename({ id: 'beta', newId: 'alpha' })).code, 'PROVIDER_EXISTS', '★ 与现有 provider 冲突');
+  assert.equal((await rename({ id: 'beta', newId: 'beta' })).code, 'INVALID_PROVIDER_ID', '★ 与自己同名');
+  assert.equal((await rename({ id: 'no-such', newId: 'whatever' })).code, 'UNKNOWN_PROVIDER');
+  assert.equal(Object.hasOwn(host.cfg.providers, 'alpha'), true);
+  assert.equal(Object.hasOwn(host.cfg.providers, 'whatever'), false, '★ 失败的改名不写盘');
+  m.dispose();
+});
+
+test('★ provider/rename：defaultModelReferences 只报告、不替用户改那处配置', async () => {
+  freshPrefsHome();
+  const patchText = [
+    '- id: agent-default-model',
+    '  name: "@deepseek-ai/dsh-agent-default-model"',
+    '  config:',
+    '    provider: beta',
+    '    model: m-glm',
+    '- id: other-plugin',
+    '  config:',
+    '    provider: beta',
+  ].join('\n');
+  const host = makeHost({ patchText });
+  const m = mount(host.ctx);
+  const body = (await m.send('POST', '/model-hub/api/provider/rename', { id: 'beta', newId: 'beta-2' })).json();
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.defaultModelReferences, true, '★ agent-default-model 的 config.provider 引用了旧 id');
+
+  // 引用别的 provider 时为 false。
+  const host2 = makeHost({ patchText: patchText.replace('provider: beta', 'provider: alpha') });
+  const m2 = mount(host2.ctx);
+  const body2 = (await m2.send('POST', '/model-hub/api/provider/rename', { id: 'beta', newId: 'beta-3' })).json();
+  assert.equal(body2.defaultModelReferences, false);
+  m.dispose();
+  m2.dispose();
+});
+
+test('provider/rename：出厂目录路由（models 来自目录）改名会被提前拦下（MODELS_REQUIRED）', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  // delta 在桩宿主里 declared:false = 出厂目录路由，profile 里没有 models 数组。
+  assert.equal(Object.hasOwn(host.cfg.providers.delta, 'models'), false);
+  const body = (await m.send('POST', '/model-hub/api/provider/rename', { id: 'delta', newId: 'delta-2' })).json();
+  assert.equal(body.code, 'MODELS_REQUIRED', '★ 新 id 不在目录里 ⇒ pi-ai 会拒绝，提前拦下不写盘');
+  assert.equal(Object.hasOwn(host.cfg.providers, 'delta-2'), false);
+  m.dispose();
+});
+
+test('provider/edit 与 provider/rename：写接口的 405 / 415 守卫', async () => {
+  freshPrefsHome();
+  const host = makeHost();
+  const m = mount(host.ctx);
+  for (const path of ['/model-hub/api/provider/edit', '/model-hub/api/provider/rename']) {
+    const wrong = await m.send('GET', path);
+    assert.equal(wrong.state.status, 405, path);
+    assert.equal(wrong.json().code, 'METHOD_NOT_ALLOWED');
+    const noType = await m.send('POST', path, { id: 'beta' }, {});
+    assert.equal(noType.state.status, 415, path);
+    assert.equal(noType.json().code, 'UNSUPPORTED_MEDIA_TYPE');
+  }
+  m.dispose();
 });
 
 
