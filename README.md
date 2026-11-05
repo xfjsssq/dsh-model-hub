@@ -51,15 +51,13 @@ pwsh -File tools\uninstall.ps1         # 卸载（-DisableOnly 只关不卸）
 
 ## 更新日志
 
-### v0.2.1（2026-11-04）
+### v0.2.0（2026-11-04）
 - **「获取模型」改为合并语义**：已有模型不会被一次"获取"覆盖清掉，只有手点模型行的叉号才会移除；已在列表的候选默认勾选且置灰、标「已在列表」；确定后提示「新增 N，保留 M」。
 - **提供商可直接编辑**：悬停左栏提供商行，正左侧浮出编辑面板，可改名称 / 显示 ID（支持改名）/ API 协议 / Base URL / Key 环境变量名；改名会联动更新排序、置顶与能力覆盖记录。
 - **置顶更醒目**：置顶行独立底色 + 常驻加粗竖条 + 图钉常驻。
 - **修复重复注册**：同一页面里插件被求值两次时不再报错（先前会弹出诊断红框），现静默让位并在 `/health` 里记 `slot-register-skipped`。
 - 档位标签 `1000K` → `1M`（只改显示，写入值不变：131072 / 262144 / 1000000）。
 - 获取模型页与面板背景改为不透明，密集列表更易读。
-
-### v0.2.0（2026-10-25）
 - 在面板内直接管理提供商与模型：添加提供商（全屏表单）、获取可用模型、勾选落盘、单模型删除。
 - 能力卡补齐设置页同款字段：输入类型（文本 / 图片）、推理等级（关 / 低 / 中 / 高）、异常值警示。
 - 选择器改为贴输入栏的浮层（去掉全屏遮罩），能力卡缩小并在鼠标停稳后钉住。
@@ -109,9 +107,8 @@ dsh-model-hub/
 
 ## 验证（2026-11-04，独立 teammate 用隔离实例 + 真宿主 + 真浏览器实测）
 
-**冻结版本（七轮独立验证全绿）**：
-`client.js` 107350 bytes / 2216 行 / sha256 `af3e5e10820eb2a2cb0c7545e37fcf3574b0086bbbfbc303efeeb32b2e365063`
-完整报告：`_recon/verify/REPORT.md`（821 行，含 31 张截图与全部原始证据）。
+**发布构建**：`client.js` 199629 bytes / 3884 行 / sha256 `27fa088bf78185015f3e19c7f0688f6d533240c76e4403bdaee4fad5c1b30780`
+七轮独立验证是在**功能等价**的上一版构建上跑的；最后两处视觉微调之后另核了 `node --check`、`node --test`（105/105）与沙盘探针（能力卡 200×247 不透明、面板「显示 ID」/「API 协议」定位、控制台 0 错误），未再重跑整轮。原始报告与截图属开发期产物，不随仓库发布。
 
 - **不需要重启即激活**：真宿主 `/model-hub/api/*` 由 404 → 200；profile 只多出 `dependencies` 一项与 `bundles` 末尾一项，`cordis.patch.yml` sha256 未变。
 - **改动真进请求**：`POST /model` 后 `prepareCall` 物化结果随之改变（`maxTokens 128000→65536`、`contextWindow 1000000→131072`、`inputModalities ['text','image']→['text']`），且**一次真实对话请求的 body 里确实带了新值**（本机 mock 上游收到 `max_completion_tokens=65536`，零上游费用）。
@@ -125,7 +122,7 @@ dsh-model-hub/
 ```powershell
 cd dsh-model-hub
 node --check index.js
-node --test        # 57 项：catalog / 写入 / NOT_EFFECTIVE / prepareCall 一致性 / selftest 还原 / 路由 / prefs / inputModalities / reasoningEfforts
+node --test        # 105 项：catalog / 写入 / NOT_EFFECTIVE / prepareCall 一致性 / selftest 还原 / 路由 / prefs / inputModalities / reasoningEfforts / provider edit·rename / 合并语义 / 重复注册幂等
 ```
 
 ## 已知限制
